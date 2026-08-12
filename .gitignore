@@ -1,0 +1,24 @@
+# Internal context, not meant for the public repo
+CLAUDE.md
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# Node (in case any action adds a JS/TS implementation)
+node_modules/

@@ -1,0 +1,22 @@
+name: Setup ECR
+description: Configure AWS credentials and log in to Amazon ECR
+
+inputs:
+  role-to-assume:
+    description: IAM role ARN to assume via OIDC
+    required: true
+  aws-region:
+    description: AWS region (e.g. us-west-2)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c  # v2.1.6

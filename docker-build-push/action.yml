@@ -1,0 +1,67 @@
+name: Docker Build & Push
+description: Configure AWS, log in to ECR, and build + push a Docker image
+
+inputs:
+  role-to-assume:
+    description: IAM role ARN to assume via OIDC
+    required: true
+  aws-region:
+    description: AWS region (e.g. us-west-2)
+    required: true
+  ecr-registry:
+    description: ECR registry URL (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com)
+    required: true
+  ecr-repo:
+    description: ECR repository name (e.g. hakimo-vision/alarm-group-etl)
+    required: true
+  dockerfile:
+    description: Path to Dockerfile
+    required: false
+    default: Dockerfile
+  context:
+    description: Docker build context path
+    required: false
+    default: .
+  tag:
+    description: Explicit image tag (e.g. base-latest). When empty, defaults to master-SHA / dev-SHA tagging.
+    required: false
+    default: ''
+  latest-on-master:
+    description: Also push a 'latest' tag when on master with no explicit tag
+    required: false
+    default: 'true'
+
+outputs:
+  tags:
+    description: Newline-separated list of pushed image tags
+    value: ${{ steps.meta.outputs.tags }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup ECR
+      uses: hakimo-ai/actions/setup-ecr@v1
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Extract Docker metadata
+      id: meta
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+      with:
+        images: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repo }}
+        tags: |
+          type=raw,enable=${{ inputs.tag != '' }},value=${{ inputs.tag }}
+          type=raw,enable=${{ inputs.tag == '' }},value=${{ github.ref_name == 'master' && format('master-{0}', github.sha) || format('dev-{0}', github.sha) }}
+          type=raw,enable=${{ inputs.tag == '' && inputs.latest-on-master == 'true' && github.ref_name == 'master' }},value=latest
+
+    - name: Set up Docker Buildx
+      uses: useblacksmith/setup-docker-builder@af73aad1881ac50c474addd444fe279cac9be318  # v1.12.0
+
+    - name: Build & Push
+      uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850  # v2.3.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
