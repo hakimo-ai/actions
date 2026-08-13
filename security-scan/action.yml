@@ -1,0 +1,389 @@
+name: Security Scan
+description: Language-aware security scan — auto-detects Python/Node/Rust/C#/IaC and runs Grype, Trivy, and Semgrep accordingly. Open-source tools only, no GitHub Advanced Security dependency.
+
+inputs:
+  path:
+    description: Root path to scan
+    required: false
+    default: '.'
+  severity-cutoff:
+    description: Minimum vulnerability severity to treat as a finding (negligible, low, medium, high, critical)
+    required: false
+    default: 'medium'
+  semgrep-config:
+    description: Semgrep ruleset config (e.g. auto, p/python, p/ci)
+    required: false
+    default: 'auto'
+  fail-on-findings:
+    description: Fail the job if any scanner reports findings
+    required: false
+    default: 'false'
+  comment-on-pr:
+    description: "Post/update a PR comment with the findings summary (requires 'pull-requests: write' in the caller). No-op outside pull_request/pull_request_target events."
+    required: false
+    default: 'true'
+  max-comment-findings:
+    description: Max number of individual findings (most severe first) to list in the collapsed detail section of the PR comment
+    required: false
+    default: '10'
+
+outputs:
+  findings-count:
+    description: Total number of findings across all scanners
+    value: ${{ steps.gate.outputs.total-findings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect project languages
+      id: detect
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+      run: |
+        set -uo pipefail
+        cd "$SCAN_PATH" || { echo "::error::path '$SCAN_PATH' not found"; exit 1; }
+        prune=( '(' -path '*/node_modules' -o -path '*/.git' ')' )
+
+        detect() {
+          local maxdepth="$1"; shift
+          find . "${prune[@]}" -prune -o -maxdepth "$maxdepth" "$@" -print 2>/dev/null | grep -q .
+        }
+
+        py=false; node=false; rust=false; csharp=false; iac=false
+        detect 3 '(' -iname 'requirements*.txt' -o -iname 'pyproject.toml' -o -iname 'setup.py' ')' && py=true
+        detect 3 -iname 'package.json' && node=true
+        detect 4 -iname 'Cargo.toml' && rust=true
+        detect 4 '(' -iname '*.csproj' -o -iname '*.sln' ')' && csharp=true
+        detect 4 '(' -iname '*.tf' -o -iname 'Dockerfile*' -o -iname 'kustomization.yaml' -o -iname 'kustomization.yml' ')' && iac=true
+        sast=false
+        if [ "$py" = true ] || [ "$node" = true ] || [ "$rust" = true ] || [ "$csharp" = true ]; then sast=true; fi
+        echo "python=$py" >> "$GITHUB_OUTPUT"
+        echo "node=$node" >> "$GITHUB_OUTPUT"
+        echo "rust=$rust" >> "$GITHUB_OUTPUT"
+        echo "csharp=$csharp" >> "$GITHUB_OUTPUT"
+        echo "iac=$iac" >> "$GITHUB_OUTPUT"
+        echo "sast=$sast" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Security scan — detected stack"
+          echo "| Python | Node/JS/TS | Rust | C#/.NET | Dockerfile/Terraform/K8s manifests |"
+          echo "|---|---|---|---|---|"
+          echo "| $py | $node | $rust | $csharp | $iac |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Map severity threshold for Trivy
+      id: severity
+      shell: bash
+      env:
+        CUTOFF: ${{ inputs.severity-cutoff }}
+      run: |
+        case "$CUTOFF" in
+          critical) list="CRITICAL" ;;
+          high) list="HIGH,CRITICAL" ;;
+          medium) list="MEDIUM,HIGH,CRITICAL" ;;
+          low|negligible) list="LOW,MEDIUM,HIGH,CRITICAL" ;;
+          *) list="MEDIUM,HIGH,CRITICAL" ;;
+        esac
+        echo "trivy-severity=$list" >> "$GITHUB_OUTPUT"
+
+    - name: Run Grype (dependency CVEs)
+      id: grype
+      continue-on-error: true
+      uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e  # v6.5.1
+      with:
+        path: ${{ inputs.path }}
+        output-format: json
+        output-file: grype-results.json
+        severity-cutoff: ${{ inputs.severity-cutoff }}
+        fail-build: 'false'
+
+    - name: Summarize Grype findings
+      id: grype-summary
+      if: always()
+      shell: bash
+      env:
+        GRYPE_OUTCOME: ${{ steps.grype.outcome }}
+      run: |
+        if [ "$GRYPE_OUTCOME" = "failure" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Grype: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq '.matches | length' grype-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Grype findings (severity >= ${{ inputs.severity-cutoff }}): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run Trivy (secrets + IaC misconfig)
+      id: trivy
+      continue-on-error: true
+      uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
+      with:
+        scan-type: fs
+        scan-ref: ${{ inputs.path }}
+        scanners: secret,misconfig
+        severity: ${{ steps.severity.outputs.trivy-severity }}
+        format: json
+        output: trivy-results.json
+        exit-code: '0'
+
+    - name: Summarize Trivy findings
+      id: trivy-summary
+      if: always()
+      shell: bash
+      env:
+        TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+      run: |
+        if [ "$TRIVY_OUTCOME" = "failure" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Trivy: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq '[.Results[]? | ((.Secrets // []) + (.Misconfigurations // []))[]] | length' trivy-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Trivy findings (secrets + misconfig): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Restore Semgrep image cache
+      id: semgrep-cache
+      if: steps.detect.outputs.sast == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: /tmp/semgrep-image.tar
+        key: semgrep-image-1.172.0
+
+    - name: Load or pull Semgrep image
+      if: steps.detect.outputs.sast == 'true'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.semgrep-cache.outputs.cache-hit }}
+      run: |
+        image='semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b'
+        if [ "$CACHE_HIT" = "true" ]; then
+          docker load -i /tmp/semgrep-image.tar
+        else
+          docker pull "$image"
+          docker save "$image" -o /tmp/semgrep-image.tar
+        fi
+
+    - name: Run Semgrep SAST
+      id: semgrep
+      if: steps.detect.outputs.sast == 'true'
+      continue-on-error: true
+      shell: bash
+      run: |
+        docker run --rm -v "$PWD:/github/workspace" -w /github/workspace \
+          semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b \
+          semgrep scan --config ${{ inputs.semgrep-config }} --json --output semgrep-results.json ${{ inputs.path }}
+
+    - name: Summarize Semgrep findings
+      id: semgrep-summary
+      if: always() && steps.detect.outputs.sast == 'true'
+      shell: bash
+      env:
+        SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+      run: |
+        if [ "$SEMGREP_OUTCOME" = "failure" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Semgrep: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Semgrep findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Evaluate findings
+      id: gate
+      if: always()
+      shell: bash
+      env:
+        GRYPE_COUNT: ${{ steps.grype-summary.outputs.count }}
+        GRYPE_FAILED: ${{ steps.grype-summary.outputs.failed }}
+        TRIVY_COUNT: ${{ steps.trivy-summary.outputs.count }}
+        TRIVY_FAILED: ${{ steps.trivy-summary.outputs.failed }}
+        SEMGREP_COUNT: ${{ steps.semgrep-summary.outputs.count }}
+        SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
+        SAST_RAN: ${{ steps.detect.outputs.sast }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        total=$(( ${GRYPE_COUNT:-0} + ${TRIVY_COUNT:-0} + ${SEMGREP_COUNT:-0} ))
+        echo "total-findings=$total" >> "$GITHUB_OUTPUT"
+
+        failed=""
+        [ "${GRYPE_FAILED:-false}" = "true" ] && failed="${failed}Grype,"
+        [ "${TRIVY_FAILED:-false}" = "true" ] && failed="${failed}Trivy,"
+        if [ "$SAST_RAN" = "true" ] && [ "${SEMGREP_FAILED:-false}" = "true" ]; then failed="${failed}Semgrep,"; fi
+        failed="${failed%,}"
+
+        if [ -n "$failed" ]; then
+          echo "any-failed=true" >> "$GITHUB_OUTPUT"
+          echo "failed-scanners=$failed" >> "$GITHUB_OUTPUT"
+          echo "::error::Scanner(s) failed to run: $failed. Findings below are incomplete."
+        else
+          echo "any-failed=false" >> "$GITHUB_OUTPUT"
+          echo "failed-scanners=" >> "$GITHUB_OUTPUT"
+        fi
+
+        if [ "$total" -gt 0 ]; then
+          echo "Security scan found $total finding(s) across Grype, Trivy, and Semgrep."
+        else
+          echo "No findings."
+        fi
+
+        if [ -n "$failed" ] || { [ "$total" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = "true" ]; }; then
+          exit 1
+        fi
+
+    - name: Upload scan reports
+      if: always() && (steps.gate.outputs.total-findings != '0' || steps.gate.outputs.any-failed == 'true')
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      with:
+        name: security-scan-reports
+        path: |
+          grype-results.json
+          trivy-results.json
+          semgrep-results.json
+        if-no-files-found: ignore
+        retention-days: 30
+
+    - name: Post PR comment
+      if: always() && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.comment-on-pr == 'true'
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+      env:
+        GRYPE_FAILED: ${{ steps.grype-summary.outputs.failed }}
+        TRIVY_FAILED: ${{ steps.trivy-summary.outputs.failed }}
+        SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
+        ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
+        FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
+        SAST_RAN: ${{ steps.detect.outputs.sast }}
+        SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
+        MAX_FINDINGS: ${{ inputs.max-comment-findings }}
+      with:
+        script: |
+          const fs = require('fs');
+          const marker = '<!-- hakimo-ai/actions/security-scan -->';
+          const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+          const anyFailed = process.env.ANY_FAILED === 'true';
+
+          // --- Pull the actual top findings out of the JSON reports, most severe first ---
+          const readJson = (file) => {
+            try {
+              return JSON.parse(fs.readFileSync(file, 'utf8'));
+            } catch {
+              return null;
+            }
+          };
+          const asArray = (v) => (Array.isArray(v) ? v : []);
+
+          // Each tool has its own severity vocabulary (Grype: Critical/High/...,
+          // Trivy: CRITICAL/HIGH/..., Semgrep: ERROR/WARNING/INFO) — this rank is
+          // just for sorting the combined list, most severe first.
+          const SEVERITY_RANK = {
+            critical: 0, error: 0,
+            high: 1,
+            medium: 2, moderate: 2, warning: 2,
+            low: 3,
+            negligible: 4, info: 4,
+            unknown: 5,
+          };
+          const rank = (s) => SEVERITY_RANK[String(s || '').toLowerCase()] ?? 5;
+
+          const findings = [];
+          const push = (tool, severity, text) => findings.push({ tool, severity: severity || 'Unknown', text });
+
+          for (const m of asArray(readJson('grype-results.json')?.matches)) {
+            push('Grype', m.vulnerability?.severity, `**Grype** ${m.vulnerability?.id || 'unknown'} in \`${m.artifact?.name || '?'}@${m.artifact?.version || '?'}\``);
+          }
+
+          for (const r of asArray(readJson('trivy-results.json')?.Results)) {
+            for (const s of asArray(r.Secrets)) {
+              push('Trivy', s.Severity, `**Trivy** secret \`${s.RuleID || s.Title || 'unknown'}\` in \`${r.Target || '?'}:${s.StartLine ?? '?'}\``);
+            }
+            for (const mc of asArray(r.Misconfigurations)) {
+              push('Trivy', mc.Severity, `**Trivy** \`${mc.ID || 'unknown'}\`: ${mc.Title || ''} in \`${r.Target || '?'}\``);
+            }
+          }
+
+          if (process.env.SAST_RAN === 'true') {
+            for (const r of asArray(readJson('semgrep-results.json')?.results)) {
+              push('Semgrep', r.extra?.severity, `**Semgrep** \`${r.check_id || 'unknown'}\` in \`${r.path}:${r.start?.line ?? '?'}\``);
+            }
+          }
+
+          findings.sort((a, b) => rank(a.severity) - rank(b.severity));
+
+          const parsedMax = parseInt(process.env.MAX_FINDINGS, 10);
+          const maxFindings = Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : 10;
+          const shown = findings.slice(0, maxFindings);
+          const hiddenCount = findings.length - shown.length;
+
+          const detailsBlock = shown.length
+            ? [
+                '<details>',
+                `<summary>Top ${shown.length} finding(s)${hiddenCount > 0 ? ` — ${hiddenCount} more in the full report` : ''}</summary>`,
+                '',
+                ...shown.map((f) => `- **${f.severity}** ${f.text}`),
+                '',
+                '</details>',
+              ].join('\n')
+            : '';
+
+          // Row counts come from the findings actually listed above (not the separately
+          // computed bash counts) so the table can never disagree with the details list.
+          const countByTool = (tool) => findings.filter((f) => f.tool === tool).length;
+          const scannerRow = (label, count, failed) =>
+            failed === 'true'
+              ? `| ${label} | failed to run — see [logs](${runUrl}) |`
+              : `| ${label} | ${count} |`;
+
+          const semgrepRow = process.env.SAST_RAN === 'true'
+            ? scannerRow('Semgrep (SAST)', countByTool('Semgrep'), process.env.SEMGREP_FAILED)
+            : '| Semgrep (SAST) | skipped (no Python/Node/Rust/C# detected) |';
+
+          const bodyLines = [
+            marker,
+            anyFailed
+              ? `### Security scan — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
+              : `### Security scan — ${findings.length} finding(s)`,
+            '',
+            '| Scanner | Findings |',
+            '|---|---|',
+            scannerRow(`Grype (dependency CVEs, severity >= ${process.env.SEVERITY_CUTOFF})`, countByTool('Grype'), process.env.GRYPE_FAILED),
+            scannerRow('Trivy (secrets + IaC misconfig)', countByTool('Trivy'), process.env.TRIVY_FAILED),
+            semgrepRow,
+            '',
+          ];
+          if (detailsBlock) {
+            bodyLines.push(detailsBlock, '');
+          }
+          bodyLines.push(`Full JSON reports: [workflow run](${runUrl}) → \`security-scan-reports\` artifact.`);
+          const body = bodyLines.join('\n');
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }
