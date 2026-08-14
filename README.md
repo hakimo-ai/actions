@@ -8,6 +8,25 @@ uses: hakimo-ai/actions/<action-name>@v1
 
 ---
 
+## Security guardrails — read this before contributing or using these actions
+
+**This repo is public.** Anything committed here (code, comments, commit messages, PR discussions) is visible to anyone on the internet, indefinitely, even after a later revert. A few rules that follow from that:
+
+- **Never commit secrets, credentials, internal hostnames/IPs, AWS account IDs, or IAM role ARNs.** Every example in this repo uses `${{ secrets.* }}`/`${{ vars.* }}` placeholders for a reason — copy that pattern, don't hardcode real values, even "just for testing."
+- **`CLAUDE.md` (if present in your checkout) is gitignored on purpose.** It carries internal architecture/planning context that isn't meant to be public. Don't remove it from `.gitignore`.
+- **Treat every PR here as reviewable by anyone, forever.** Don't paste internal Slack threads, ticket numbers with sensitive context, or infrastructure details into commit messages or PR descriptions beyond what's needed to explain the change.
+- **Review dependency-bump PRs like any other code change, not a rubber stamp.** The whole point of [SHA-pinning](#why-commit-sha-pinning) is that a version bump is visible in a diff — actually look at it. Skipping that review defeats the protection.
+
+### "Pwn requests" — the pattern to watch for across every action here
+
+Several actions in this repo (`docker-build-push`, `lint-check`, and to a lesser extent `security-scan`) execute code or run scanners against whatever is checked out in the calling job. GitHub Actions has a well-known vulnerability class where a workflow triggered by `pull_request_target` (which runs with the *base* repo's secrets and write permissions) also checks out an *external fork's* PR head — handing that fork's untrusted code the base repo's credentials. See GitHub's own [Preventing pwn requests](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/) writeup if this is new to you.
+
+**The short version:** if a caller workflow uses `pull_request_target`, do not also check out the PR's head ref in the same job before calling one of these actions. Use plain `pull_request` (runs with a reduced, fork-scoped token and no repo secrets) unless you specifically need `pull_request_target`'s elevated access — and if you do, gate the run behind a required reviewer (a GitHub Environment with required reviewers) instead of letting it run automatically on every fork PR.
+
+Each action's own README has a **Security guardrails** section with specifics for that action — [`lint-check`'s](lint-check/README.md#security-guardrails) is the most important to read, since it's the one action here that installs dependencies and compiles code from the target repo as part of its normal operation, not just as an edge case.
+
+---
+
 ## Local setup
 
 ```bash
@@ -47,7 +66,18 @@ All versions stay on the same major as `ai-engine`'s existing workflows to avoid
 | `docker/metadata-action` | v6.2.0 | `dc802804100637a589fabce1cb79ff13a1411302` |
 | `useblacksmith/setup-docker-builder` | v1.12.0 | `af73aad1881ac50c474addd444fe279cac9be318` |
 | `useblacksmith/build-push-action` | v2.3.0 | `9b0579bbec7a6cad2f171596c57e7ac1e7658850` |
-| `actions/checkout` *(callers)* | v4.3.1 | `34e114876b0b11c390a56381ad16ebd13914f8d5` |
+| `aquasecurity/trivy-action` | v0.36.0 | `a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8` |
+| `anchore/scan-action` | v6.5.1 | `1638637db639e0ade3258b51db49a9a137574c3e` |
+| `actions/upload-artifact` | v4.6.2 | `ea165f8d65b6e75b540449e92b4886f43607fa02` |
+| `actions/github-script` | v7.1.0 | `f28e40c7f34bde8b3046d885e986cb6290c5673b` |
+| `actions/cache` | v4.3.0 | `0057852bfaa89a56745cba8c7296529d2fc39830` |
+| `semgrep/semgrep` *(docker image, digest-pinned)* | 1.173.0 | `sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a` |
+| `actions/setup-python` | v5.6.0 | `a26af69be951a213d495a4c3e4e4022e16d87065` |
+| `actions/setup-node` | v6.5.0 | `249970729cb0ef3589644e2896645e5dc5ba9c38` |
+| `dtolnay/rust-toolchain` | v1 (2025-08-23) | `e97e2d8cc328f1b50210efc529dca0028893a2d9` |
+| `actions/checkout` *(callers)* | v4.4.0 | `11d5960a326750d5838078e36cf38b85af677262` |
+
+`actions/setup-python` and `actions/setup-node` are dependencies introduced by `lint-check` — nothing in the org uses either today, so there's no existing major to match. Pinned to the latest release on the most mature major (v5 / v6) rather than the freshly-cut v6/v7 majors with zero patch releases yet, for the same "won't break" reasoning as matching `ai-engine`'s existing majors elsewhere in this table. `dtolnay/rust-toolchain` doesn't use semver releases — it's the actively maintained, MIT-licensed replacement for the archived `actions-rs/toolchain`, and its own docs recommend pinning `@v1` (a maintained moving tag); pinned here to the commit `v1` currently resolves to, same SHA-pinning rationale as everything else. `lint-check` also installs `ruff`/`yamllint` from PyPI, version-pinned (not SHA-pinned — PyPI has no equivalent); see [`lint-check`'s README](lint-check/README.md#security-guardrails) for the caveat that implies.
 
 **How to update a dependency:**
 1. Find the new release tag on the action's GitHub repo
@@ -59,18 +89,11 @@ All versions stay on the same major as `ai-engine`'s existing workflows to avoid
 
 ## Actions
 
-### `setup-ecr`
+Each action has its own detailed README covering how it works step by step, full inputs/outputs, and — since this repo is public — an action-specific **Security guardrails** section. Start there before wiring one of these into a workflow; the summaries below are just enough to pick the right action.
 
-Wraps `configure-aws-credentials` + `amazon-ecr-login` into a single step. Used anywhere a workflow needs AWS access or ECR access without doing a full Docker build.
+### [`setup-ecr`](setup-ecr/README.md)
 
-**Inputs**
-
-| Input | Required | Description |
-|-------|----------|-------------|
-| `role-to-assume` | yes | IAM role ARN to assume via OIDC |
-| `aws-region` | yes | AWS region (e.g. `us-west-2`) |
-
-**Example**
+Wraps `configure-aws-credentials` + `amazon-ecr-login` into a single step. Used anywhere a workflow needs AWS/ECR access without doing a full Docker build. Requires `id-token: write`.
 
 ```yaml
 permissions:
@@ -84,36 +107,11 @@ steps:
       aws-region: ${{ vars.AWS_REGION }}
 ```
 
-> Requires `id-token: write` so the OIDC token can be exchanged for AWS credentials.
-
 ---
 
-### `docker-build-push`
+### [`docker-build-push`](docker-build-push/README.md)
 
-Full ECR auth + Docker metadata + build + push in one step. Internally calls `setup-ecr`, so you do not need a separate `setup-ecr` step when using this action.
-
-Replaces the 5-step boilerplate (`configure-aws-credentials` → `amazon-ecr-login` → `metadata-action` → `setup-docker-builder` → `build-push-action`) that was copy-pasted across every `build-docker-*.yml` in `ai-engine`.
-
-**Inputs**
-
-| Input | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `role-to-assume` | yes | — | IAM role ARN |
-| `aws-region` | yes | — | AWS region |
-| `ecr-registry` | yes | — | ECR registry URL |
-| `ecr-repo` | yes | — | ECR repository name (e.g. `hakimo-vision/alarm-group-etl`) |
-| `dockerfile` | no | `Dockerfile` | Path to Dockerfile |
-| `context` | no | `.` | Docker build context |
-| `tag` | no | `''` | Explicit tag (e.g. `base-latest`). When empty: `master-{SHA}` on master, `dev-{SHA}` on branches |
-| `latest-on-master` | no | `true` | Also push a `latest` tag on master when no explicit tag is set. Set to `false` for images that use their own fixed tag (e.g. `base-latest`) |
-
-**Outputs**
-
-| Output | Description |
-|--------|-------------|
-| `tags` | Newline-separated list of all pushed image tags |
-
-**Example**
+Full ECR auth + Docker metadata + build + push in one step (internally calls `setup-ecr`). Replaces the 5-step boilerplate that used to be copy-pasted across every `build-docker-*.yml` in `ai-engine`.
 
 ```yaml
 permissions:
@@ -121,7 +119,7 @@ permissions:
   contents: read
 
 steps:
-  - uses: actions/checkout@v3
+  - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
   - id: build
     uses: hakimo-ai/actions/docker-build-push@v1
@@ -129,49 +127,17 @@ steps:
       role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
       aws-region: ${{ vars.AWS_REGION }}
       ecr-registry: ${{ secrets.ECR_REGISTRY }}
-      ecr-repo: hakimo-vision/alarm-group-etl
+      ecr-repo: company-vision/alarm-group-etl
       dockerfile: ./Dockerfile.alarmgroups.etl
-      tag: ${{ inputs.tag }}
 
   - run: echo "Pushed ${{ steps.build.outputs.tags }}"
 ```
 
 ---
 
-### `security-scan`
+### [`security-scan`](security-scan/README.md)
 
-Language-aware security scan. Auto-detects what's in the repo (Python, Node/JS/TS, Rust, C#/.NET, Dockerfile/Terraform/K8s manifests) and runs the right open-source scanners without per-language configuration. No GitHub Advanced Security dependency — no CodeQL, no SARIF upload to the Security tab (the org doesn't have a GHAS license).
-
-- **Grype** (`anchore/scan-action`, path-scan mode) — dependency CVEs. Same tool already used for image scanning in `ai-engine/tag_bump.yml` (`anchore/sbom-action` + `anchore/scan-action`), now applied at source level instead of Trivy, to keep one vuln-scanning tool org-wide. Auto-detects Python, npm/yarn, Cargo, and NuGet manifests via Syft's catalogers.
-- **Trivy** (`fs` scan, `secret,misconfig` scanners — vuln scanning is Grype's job) — secrets and IaC/Dockerfile/K8s misconfig, in one pass. Chosen over a dedicated secrets tool (e.g. Gitleaks) to keep the scan fast: it's already running for misconfig, so enabling its secret scanner is free (no extra image pull/step), at the cost of only scanning the current working tree rather than full git history. This is also what actually scans `deploy`, which is almost entirely Kustomize/K8s YAML.
-- **Semgrep** (`--config auto`) — SAST, auto-selects rulesets per language. Only runs if Python, Node, Rust, or C# source is detected (skipped for pure-manifest repos like `deploy`). The image is cached (`actions/cache`, keyed on the pinned Semgrep version) and loaded via `docker load` instead of pulled fresh every run — the pipeline was built to be fast, and a cold image pull was the single largest per-run cost outside the scans themselves.
-
-All three scanners report findings without failing the job by default (`fail-on-findings: false`). Since there's no Security-tab integration, results are written as JSON (`grype-results.json`, `trivy-results.json`, `semgrep-results.json`) and uploaded as a `security-scan-reports` workflow artifact — skipped when there's nothing to show (zero findings and nothing failed), so the common case doesn't burn artifact storage on every PR.
-
-**A scanner crashing (tool error, not "found findings") always fails the job**, regardless of `fail-on-findings`. Each scanner (Grype/Trivy/Semgrep) runs with `continue-on-error: true` so one crashing doesn't block the others from running, but the "Evaluate findings" step checks each one's actual outcome and fails loudly — with a `::error::` annotation naming which scanner(s) failed — if any of them didn't complete. This matters because `fail-on-findings: false` (the default) means the PR comment, not the job's red/green status, is what most reviewers will actually look at — so a crash has to be visible *in that comment* ("Security scan — incomplete (Grype failed to run)") rather than silently rendering as "0 findings," which would look identical to a clean scan.
-
-On `pull_request`/`pull_request_target` events, the action also posts (and on re-runs, updates in place — it won't spam a new comment on every push, and correctly paginates through all existing PR comments to find its own) a single PR comment summarizing findings per scanner, with a link to the full JSON reports artifact. This is centralized here in the composite action, not per-caller — every repo that uses `security-scan` on a PR trigger gets PR comments automatically, no extra workflow logic needed in `ai-engine`/`vision`/`hakimo-ui`/`deploy` beyond the `pull-requests: write` permission below. It's a no-op (skipped, no error) on `push` or other non-PR events.
-
-**The comment itself stays compact.** The always-visible part is just the per-scanner count table (3-4 lines). The actual individual findings — CVE IDs, secret rule IDs, misconfig IDs, Semgrep check IDs, each with severity and location — are pulled straight out of the JSON reports and listed most-severe-first inside a collapsed `<details>` block (`Top N finding(s) — M more in the full report`), so a reviewer sees a one-glance summary by default and can expand for real detail without leaving GitHub or downloading the artifact. Capped at `max-comment-findings` (default 10) to keep the comment from growing unbounded on a badly-behaved repo with hundreds of findings; the rest are still in the full JSON artifact.
-
-**Inputs**
-
-| Input | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `path` | no | `.` | Root path to scan |
-| `severity-cutoff` | no | `medium` | Minimum severity to treat as a finding (`negligible`, `low`, `medium`, `high`, `critical`) — drives both Grype's cutoff and Trivy's severity list |
-| `semgrep-config` | no | `auto` | Semgrep ruleset config (e.g. `auto`, `p/python`, `p/ci`) |
-| `fail-on-findings` | no | `false` | Fail the job if any scanner reports findings (a scanner crash always fails the job regardless of this setting) |
-| `comment-on-pr` | no | `true` | Post/update a PR comment with the findings summary. No-op outside `pull_request`/`pull_request_target` events |
-| `max-comment-findings` | no | `10` | Max number of individual findings (most severe first) to list in the PR comment's collapsed detail section |
-
-**Outputs**
-
-| Output | Description |
-|--------|--------------|
-| `findings-count` | Total number of findings across all scanners |
-
-**Example**
+Language-aware security scan — auto-detects Python/Node/Rust/C#/IaC and runs Grype (dependency CVEs), Trivy (secrets + IaC misconfig), and Semgrep (SAST) accordingly. No GitHub Advanced Security dependency: no CodeQL, no SARIF upload. Posts a compact PR comment with the real top findings, centralized so every caller repo gets it for free.
 
 ```yaml
 permissions:
@@ -179,7 +145,7 @@ permissions:
   pull-requests: write   # required for the PR comment (comment-on-pr, default true)
 
 steps:
-  - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+  - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
     with:
       fetch-depth: 0
 
@@ -187,10 +153,26 @@ steps:
     with:
       path: .
       severity-cutoff: 'medium'
-      fail-on-findings: 'false'
 ```
 
-> Set `comment-on-pr: 'false'` and drop `pull-requests: write` for workflows that only ever run on `push` (no PR to comment on), or that just want the step summary / artifact without a PR comment.
+---
+
+### [`lint-check`](lint-check/README.md)
+
+Language-aware lint/format check — Ruff (Python), ESLint + Prettier (Node, when configured), cargo fmt + clippy (Rust), yamllint. Same PR-comment pattern as `security-scan`. **Unlike `security-scan`, this action executes target-repo code** (`npm ci`, `cargo` compilation) — read its [security guardrails](lint-check/README.md#security-guardrails) before using it on anything that might check out untrusted content.
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write   # required for the PR comment (comment-on-pr, default true)
+
+steps:
+  - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+  - uses: hakimo-ai/actions/lint-check@v1
+    with:
+      path: .
+```
 
 ---
 

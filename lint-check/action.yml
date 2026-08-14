@@ -1,0 +1,638 @@
+name: Lint Check
+description: Language-aware lint/format check. Detects Python/Node/Rust in the target repo and runs the matching linter; C#/Go/C++ are detected but intentionally out of scope (see README).
+
+inputs:
+  path:
+    description: Root path to lint
+    required: false
+    default: .
+  python-version:
+    description: Python version for Ruff
+    required: false
+    default: '3.12'
+  node-version:
+    description: Node version for ESLint/Prettier
+    required: false
+    default: '20'
+  rust-toolchain:
+    description: Rust toolchain channel for cargo fmt/clippy (e.g. stable, 1.75.0)
+    required: false
+    default: stable
+  fail-on-findings:
+    description: Fail the job if any linter reports findings (a linter crash always fails the job regardless of this setting)
+    required: false
+    default: 'false'
+  comment-on-pr:
+    description: Post/update a PR comment with the findings summary. No-op outside pull_request/pull_request_target events
+    required: false
+    default: 'true'
+  max-comment-findings:
+    description: Max number of individual findings (most severe first) to list in the PR comment's collapsed detail section
+    required: false
+    default: '10'
+
+outputs:
+  findings-count:
+    description: Total number of findings across all linters
+    value: ${{ steps.gate.outputs.total-findings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect project languages
+      id: detect
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+      run: |
+        set -uo pipefail
+        cd "$SCAN_PATH" || { echo "::error::path '$SCAN_PATH' not found"; exit 1; }
+
+        prune=( '(' -path '*/node_modules' -o -path '*/.git' -o -path '*/target' -o -path '*/dist' -o -path '*/build' -o -path '*/.venv' ')' )
+
+        detect() {
+          find . "${prune[@]}" -prune -o -maxdepth 6 -type f \( "$@" \) -print -quit
+        }
+
+        python="false"; node="false"; rust="false"; csharp="false"; go="false"; cpp="false"; yaml="false"
+        eslint="false"; prettier="false"; pkg_manager="npm"
+
+        [ -n "$(detect -iname 'requirements*.txt' -o -iname 'pyproject.toml' -o -iname 'setup.py')" ] && python="true"
+        [ -n "$(detect -iname 'package.json')" ] && node="true"
+        [ -n "$(detect -iname 'Cargo.toml')" ] && rust="true"
+        [ -n "$(detect -iname '*.csproj' -o -iname '*.sln')" ] && csharp="true"
+        [ -n "$(detect -iname '*.go')" ] && go="true"
+        [ -n "$(detect -iname '*.cpp' -o -iname '*.cc' -o -iname '*.hpp' -o -iname '*.h')" ] && cpp="true"
+        [ -n "$(detect -iname '*.yml' -o -iname '*.yaml')" ] && yaml="true"
+
+        if [ "$node" = "true" ]; then
+          [ -n "$(detect -iname '.eslintrc*' -o -iname 'eslint.config.*')" ] && eslint="true"
+
+          pkg="$(detect -iname '.prettierrc*')"
+          [ -n "$pkg" ] && prettier="true"
+          if [ "$prettier" = "false" ] && [ -f package.json ] && jq -e '.prettier' package.json >/dev/null 2>&1; then
+            prettier="true"
+          fi
+
+          [ -n "$(detect -iname 'yarn.lock')" ] && pkg_manager="yarn"
+          [ -n "$(detect -iname 'pnpm-lock.yaml')" ] && pkg_manager="pnpm"
+        fi
+
+        {
+          echo "python=$python"
+          echo "node=$node"
+          echo "rust=$rust"
+          echo "csharp=$csharp"
+          echo "go=$go"
+          echo "cpp=$cpp"
+          echo "yaml=$yaml"
+          echo "eslint=$eslint"
+          echo "prettier=$prettier"
+          echo "pkg-manager=$pkg_manager"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Detected: python=$python node=$node(eslint=$eslint,prettier=$prettier) rust=$rust csharp=$csharp go=$go cpp=$cpp yaml=$yaml" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Setup Python
+      if: steps.detect.outputs.python == 'true' || steps.detect.outputs.yaml == 'true'
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Run Ruff (format + lint)
+      id: ruff
+      if: steps.detect.outputs.python == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        pip install --quiet ruff==0.16.3
+
+        set +e
+        ruff format --check . > ruff-format-results.txt 2>&1
+        fmt_code=$?
+        ruff check --output-format=json --output-file ruff-results.json .
+        chk_code=$?
+        set -e
+
+        # Ruff's own convention: 0 = clean, 1 = findings, >1 = a real tool error.
+        if [ "$fmt_code" -gt 1 ] || [ "$chk_code" -gt 1 ]; then
+          echo "::error::Ruff exited abnormally (format=$fmt_code, check=$chk_code) - see logs"
+          exit 1
+        fi
+
+    - name: Summarize Ruff findings
+      id: ruff-summary
+      if: always() && steps.detect.outputs.python == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.ruff.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Ruff: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          fmt_count=$(grep -c '^Would reformat:' ruff-format-results.txt 2>/dev/null || echo 0)
+          chk_count=$(jq 'length' ruff-results.json 2>/dev/null || echo 0)
+          count=$((fmt_count + chk_count))
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Ruff findings (format + lint): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Setup Node
+      if: steps.detect.outputs.eslint == 'true' || steps.detect.outputs.prettier == 'true'
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ steps.detect.outputs.pkg-manager }}
+        cache-dependency-path: |
+          ${{ inputs.path }}/package-lock.json
+          ${{ inputs.path }}/yarn.lock
+          ${{ inputs.path }}/pnpm-lock.yaml
+
+    - name: Install Node dependencies
+      id: node-install
+      if: steps.detect.outputs.eslint == 'true' || steps.detect.outputs.prettier == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        case "${{ steps.detect.outputs.pkg-manager }}" in
+          yarn) yarn install --frozen-lockfile ;;
+          pnpm) corepack enable && pnpm install --frozen-lockfile ;;
+          *) npm ci ;;
+        esac
+
+    - name: Run ESLint
+      id: eslint
+      if: steps.detect.outputs.eslint == 'true' && steps.node-install.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if ! npx --no-install eslint --version > /dev/null 2>eslint-resolve-error.txt; then
+          echo "::error::eslint could not be resolved via npx --no-install - is it a devDependency?"
+          cat eslint-resolve-error.txt
+          exit 1
+        fi
+
+        set +e
+        npx --no-install eslint . --format json --output-file eslint-results.json
+        code=$?
+        set -e
+        # ESLint convention: 0 = clean, 1 = lint errors found, 2 = a real tool/config error.
+        # The binary itself is confirmed resolvable above, so a >1 exit here is a genuine
+        # ESLint/config crash, not "npx couldn't find eslint".
+        if [ "$code" -gt 1 ]; then
+          echo "::error::ESLint exited abnormally ($code) - see logs"
+          exit 1
+        fi
+
+    - name: Summarize ESLint findings
+      id: eslint-summary
+      if: always() && steps.detect.outputs.eslint == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.node-install.outcome }}" != "success" ] || [ "${{ steps.eslint.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "ESLint: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq '[.[].messages[]] | length' eslint-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "ESLint findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run Prettier
+      id: prettier
+      if: steps.detect.outputs.prettier == 'true' && steps.node-install.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if ! npx --no-install prettier --version > /dev/null 2>prettier-resolve-error.txt; then
+          echo "::error::prettier could not be resolved via npx --no-install - is it a devDependency?"
+          cat prettier-resolve-error.txt
+          exit 1
+        fi
+
+        set +e
+        npx --no-install prettier --check . > prettier-results.txt 2>&1
+        code=$?
+        set -e
+        # Prettier: 0 = clean, 1 = unformatted files found, 2 = a real tool error.
+        # The binary itself is confirmed resolvable above, so a >1 exit here is a genuine
+        # Prettier/config crash, not "npx couldn't find prettier".
+        if [ "$code" -gt 1 ]; then
+          echo "::error::Prettier exited abnormally ($code) - see logs"
+          exit 1
+        fi
+
+    - name: Summarize Prettier findings
+      id: prettier-summary
+      if: always() && steps.detect.outputs.prettier == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.node-install.outcome }}" != "success" ] || [ "${{ steps.prettier.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Prettier: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(grep -c '^\[warn\]' prettier-results.txt 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Prettier findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Setup Rust toolchain
+      if: steps.detect.outputs.rust == 'true'
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (2025-08-23)
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: clippy, rustfmt
+
+    - name: Run cargo fmt + clippy
+      id: rust
+      if: steps.detect.outputs.rust == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        set +e
+        cargo fmt --all --check > cargo-fmt-results.txt 2>&1
+        fmt_code=$?
+        cargo clippy --all-targets --message-format=json > cargo-clippy-results.json 2>cargo-clippy-stderr.txt
+        clippy_code=$?
+        set -e
+
+        # cargo fmt --check: 0 = clean, 1 = would reformat, >1 = a real crash.
+        # cargo clippy: 0 = clean. 101 is cargo's generic "build failed" code, which
+        # covers both "clippy reported errors" (real findings, present in the JSON
+        # stream) and a hard compile failure that produced no JSON diagnostics at all
+        # (a genuine crash). Only treat 101 as findings when the JSON stream actually
+        # has content backing that up - an empty results file means nothing was ever
+        # reported, so it's a crash despite the "expected" exit code.
+        clippy_crash="false"
+        if [ "$clippy_code" -ne 0 ] && [ "$clippy_code" -ne 101 ]; then
+          clippy_crash="true"
+        elif [ "$clippy_code" -eq 101 ] && [ ! -s cargo-clippy-results.json ]; then
+          clippy_crash="true"
+        fi
+
+        if [ "$fmt_code" -gt 1 ] || [ "$clippy_crash" = "true" ]; then
+          echo "::error::cargo fmt/clippy exited abnormally (fmt=$fmt_code, clippy=$clippy_code) - see logs"
+          cat cargo-clippy-stderr.txt >&2
+          exit 1
+        fi
+
+    - name: Summarize Rust findings
+      id: rust-summary
+      if: always() && steps.detect.outputs.rust == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.rust.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "cargo fmt/clippy: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          fmt_count=$(grep -c '^Diff in' cargo-fmt-results.txt 2>/dev/null || echo 0)
+          clippy_count=$(jq -s '[.[] | select(.reason == "compiler-message" and (.message.level == "warning" or .message.level == "error"))] | length' cargo-clippy-results.json 2>/dev/null || echo 0)
+          count=$((fmt_count + clippy_count))
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "cargo fmt/clippy findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run yamllint
+      id: yamllint
+      if: steps.detect.outputs.yaml == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        pip install --quiet yamllint==1.38.0
+
+        set +e
+        yamllint -f parsable . > yamllint-results.txt 2>&1
+        code=$?
+        set -e
+        # yamllint: 0 = clean, 1 = findings (warnings/errors), >1 = a real tool error
+        # (e.g. bad .yamllint config).
+        if [ "$code" -gt 1 ]; then
+          echo "::error::yamllint exited abnormally ($code) - see logs"
+          exit 1
+        fi
+
+    - name: Summarize yamllint findings
+      id: yamllint-summary
+      if: always() && steps.detect.outputs.yaml == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.yamllint.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "yamllint: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(grep -cE '\[(warning|error)\]' yamllint-results.txt 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "yamllint findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Evaluate findings
+      id: gate
+      if: always()
+      shell: bash
+      env:
+        RUFF_COUNT: ${{ steps.ruff-summary.outputs.count }}
+        RUFF_FAILED: ${{ steps.ruff-summary.outputs.failed }}
+        ESLINT_COUNT: ${{ steps.eslint-summary.outputs.count }}
+        ESLINT_FAILED: ${{ steps.eslint-summary.outputs.failed }}
+        PRETTIER_COUNT: ${{ steps.prettier-summary.outputs.count }}
+        PRETTIER_FAILED: ${{ steps.prettier-summary.outputs.failed }}
+        RUST_COUNT: ${{ steps.rust-summary.outputs.count }}
+        RUST_FAILED: ${{ steps.rust-summary.outputs.failed }}
+        YAML_COUNT: ${{ steps.yamllint-summary.outputs.count }}
+        YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        total=$(( ${RUFF_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${YAML_COUNT:-0} ))
+
+        failed_scanners=""
+        any_failed="false"
+        for pair in "Ruff:${RUFF_FAILED:-false}" \
+                    "ESLint:${ESLINT_FAILED:-false}" \
+                    "Prettier:${PRETTIER_FAILED:-false}" \
+                    "cargo fmt/clippy:${RUST_FAILED:-false}" \
+                    "yamllint:${YAML_FAILED:-false}"; do
+          name="${pair%%:*}"
+          val="${pair#*:}"
+          if [ "$val" = "true" ]; then
+            any_failed="true"
+            failed_scanners="${failed_scanners:+$failed_scanners, }$name"
+          fi
+        done
+
+        {
+          echo "total-findings=$total"
+          echo "any-failed=$any_failed"
+          echo "failed-scanners=$failed_scanners"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "### Lint check: $total finding(s)" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$any_failed" = "true" ]; then
+          echo "::error::Linter(s) failed to run: $failed_scanners"
+          exit 1
+        fi
+
+        if [ "$total" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = "true" ]; then
+          echo "::error::$total lint finding(s) at or above the configured threshold"
+          exit 1
+        fi
+
+    - name: Upload lint reports
+      if: always() && (steps.gate.outputs.total-findings != '0' || steps.gate.outputs.any-failed == 'true')
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      with:
+        name: lint-check-reports
+        path: |
+          ${{ inputs.path }}/ruff-format-results.txt
+          ${{ inputs.path }}/ruff-results.json
+          ${{ inputs.path }}/eslint-results.json
+          ${{ inputs.path }}/prettier-results.txt
+          ${{ inputs.path }}/cargo-fmt-results.txt
+          ${{ inputs.path }}/cargo-clippy-results.json
+          ${{ inputs.path }}/cargo-clippy-stderr.txt
+          ${{ inputs.path }}/yamllint-results.txt
+        if-no-files-found: ignore
+        retention-days: 30
+
+    - name: Post PR comment
+      if: always() && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.comment-on-pr == 'true'
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+      env:
+        RUFF_FAILED: ${{ steps.ruff-summary.outputs.failed }}
+        ESLINT_FAILED: ${{ steps.eslint-summary.outputs.failed }}
+        PRETTIER_FAILED: ${{ steps.prettier-summary.outputs.failed }}
+        RUST_FAILED: ${{ steps.rust-summary.outputs.failed }}
+        YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
+        ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
+        FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
+        PYTHON_RAN: ${{ steps.detect.outputs.python }}
+        NODE_DETECTED: ${{ steps.detect.outputs.node }}
+        ESLINT_RAN: ${{ steps.detect.outputs.eslint }}
+        PRETTIER_RAN: ${{ steps.detect.outputs.prettier }}
+        RUST_RAN: ${{ steps.detect.outputs.rust }}
+        YAML_RAN: ${{ steps.detect.outputs.yaml }}
+        CSHARP_DETECTED: ${{ steps.detect.outputs.csharp }}
+        GO_DETECTED: ${{ steps.detect.outputs.go }}
+        CPP_DETECTED: ${{ steps.detect.outputs.cpp }}
+        SCAN_PATH: ${{ inputs.path }}
+        MAX_FINDINGS: ${{ inputs.max-comment-findings }}
+        WORKDIR: ${{ github.workspace }}
+      with:
+        script: |
+          const path = require('path');
+          const fs = require('fs');
+          const marker = '<!-- hakimo-ai/actions/lint-check -->';
+          const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+          const anyFailed = process.env.ANY_FAILED === 'true';
+          const scanPath = process.env.SCAN_PATH || '.';
+          const scanDir = path.isAbsolute(scanPath) ? scanPath : path.join(process.env.WORKDIR, scanPath);
+
+          const readJson = (file) => {
+            try {
+              return JSON.parse(fs.readFileSync(path.join(scanDir, file), 'utf8'));
+            } catch {
+              return null;
+            }
+          };
+          const readLines = (file) => {
+            try {
+              return fs.readFileSync(path.join(scanDir, file), 'utf8').split('\n').filter(Boolean);
+            } catch {
+              return [];
+            }
+          };
+          const asArray = (v) => (Array.isArray(v) ? v : []);
+
+          const findings = [];
+          const push = (tool, severity, text) => findings.push({ tool, severity: severity || 'warning', text });
+
+          if (process.env.PYTHON_RAN === 'true') {
+            for (const f of asArray(readJson('ruff-results.json'))) {
+              push('Ruff', f.severity, `**Ruff** \`${f.code || 'unknown'}\` ${f.message || ''} in \`${f.filename || '?'}:${f.location?.row ?? '?'}\``);
+            }
+            for (const line of readLines('ruff-format-results.txt')) {
+              if (line.startsWith('Would reformat:')) {
+                push('Ruff', 'warning', `**Ruff** needs formatting: \`${line.replace('Would reformat:', '').trim()}\``);
+              }
+            }
+          }
+
+          if (process.env.ESLINT_RAN === 'true') {
+            for (const file of asArray(readJson('eslint-results.json'))) {
+              for (const m of asArray(file.messages)) {
+                const sev = m.severity === 2 ? 'error' : 'warning';
+                push('ESLint', sev, `**ESLint** \`${m.ruleId || 'unknown'}\` ${m.message || ''} in \`${file.filePath || '?'}:${m.line ?? '?'}\``);
+              }
+            }
+          }
+
+          if (process.env.PRETTIER_RAN === 'true') {
+            for (const line of readLines('prettier-results.txt')) {
+              if (line.startsWith('[warn]')) {
+                push('Prettier', 'warning', `**Prettier** needs formatting: \`${line.replace('[warn]', '').trim()}\``);
+              }
+            }
+          }
+
+          if (process.env.RUST_RAN === 'true') {
+            for (const line of readLines('cargo-clippy-results.json')) {
+              let msg;
+              try {
+                msg = JSON.parse(line);
+              } catch {
+                continue;
+              }
+              if (msg.reason !== 'compiler-message') continue;
+              const level = msg.message?.level;
+              if (level !== 'warning' && level !== 'error') continue;
+              const span = asArray(msg.message?.spans).find((s) => s.is_primary) || asArray(msg.message?.spans)[0];
+              push('cargo clippy', level, `**clippy** ${msg.message?.message || 'unknown'} in \`${span?.file_name || '?'}:${span?.line_start ?? '?'}\``);
+            }
+            for (const line of readLines('cargo-fmt-results.txt')) {
+              if (line.startsWith('Diff in')) {
+                push('cargo fmt', 'warning', `**cargo fmt** needs formatting: \`${line.replace('Diff in', '').split(' at ')[0].trim()}\``);
+              }
+            }
+          }
+
+          if (process.env.YAML_RAN === 'true') {
+            for (const line of readLines('yamllint-results.txt')) {
+              const m = line.match(/^(.+):(\d+):(\d+): \[(warning|error)\] (.+)$/);
+              if (m) {
+                push('yamllint', m[4], `**yamllint** ${m[5]} in \`${m[1]}:${m[2]}\``);
+              }
+            }
+          }
+
+          const SEVERITY_RANK = { error: 0, warning: 1 };
+          const rank = (s) => SEVERITY_RANK[String(s || '').toLowerCase()] ?? 2;
+          findings.sort((a, b) => rank(a.severity) - rank(b.severity));
+
+          const parsedMax = parseInt(process.env.MAX_FINDINGS, 10);
+          const maxFindings = Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : 10;
+          const shown = findings.slice(0, maxFindings);
+          const hiddenCount = findings.length - shown.length;
+
+          const detailsBlock = shown.length
+            ? [
+                '<details>',
+                `<summary>Top ${shown.length} finding(s)${hiddenCount > 0 ? ` — ${hiddenCount} more in the full report` : ''}`,
+                '',
+                ...shown.map((f) => `- **${f.severity}** ${f.text}`),
+                '',
+                '</details>',
+              ].join('\n')
+            : '';
+
+          const countByTool = (tool) => findings.filter((f) => f.tool === tool).length;
+          const scannerRow = (label, count, failed) =>
+            failed === 'true'
+              ? `| ${label} | failed to run — see [logs](${runUrl}) |`
+              : `| ${label} | ${count} |`;
+
+          const rows = [];
+          rows.push(
+            process.env.PYTHON_RAN === 'true'
+              ? scannerRow('Ruff (Python format + lint)', countByTool('Ruff'), process.env.RUFF_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.ESLINT_RAN === 'true'
+              ? scannerRow('ESLint', countByTool('ESLint'), process.env.ESLINT_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.PRETTIER_RAN === 'true'
+              ? scannerRow('Prettier', countByTool('Prettier'), process.env.PRETTIER_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.RUST_RAN === 'true'
+              ? scannerRow('cargo fmt/clippy', countByTool('cargo clippy') + countByTool('cargo fmt'), process.env.RUST_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.YAML_RAN === 'true'
+              ? scannerRow('yamllint', countByTool('yamllint'), process.env.YAML_FAILED)
+              : null,
+          );
+
+          const outOfScope = [];
+          if (process.env.CSHARP_DETECTED === 'true') outOfScope.push('C#');
+          if (process.env.GO_DETECTED === 'true') outOfScope.push('Go');
+          if (process.env.CPP_DETECTED === 'true') outOfScope.push('C++');
+          if (process.env.NODE_DETECTED === 'true' && process.env.ESLINT_RAN !== 'true' && process.env.PRETTIER_RAN !== 'true') {
+            outOfScope.push('Node (no ESLint/Prettier config found)');
+          }
+
+          const bodyLines = [
+            marker,
+            anyFailed
+              ? `### Lint check — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
+              : `### Lint check — ${findings.length} finding(s)`,
+            '',
+            '| Linter | Findings |',
+            '|---|---|',
+            ...rows.filter(Boolean),
+            '',
+          ];
+          if (outOfScope.length) {
+            bodyLines.push(`_${outOfScope.join(', ')} detected but not linted by this action — see README._`, '');
+          }
+          if (detailsBlock) {
+            bodyLines.push(detailsBlock, '');
+          }
+          bodyLines.push(`Full reports: [workflow run](${runUrl}) → \`lint-check-reports\` artifact.`);
+          let body = bodyLines.join('\n');
+
+          // GitHub caps issue/PR comment bodies at 65536 characters. A very large
+          // max-comment-findings on a badly-linted repo could blow past that, which
+          // would otherwise fail createComment/updateComment outright. Drop the
+          // collapsed details block (the summary table + artifact link still post)
+          // rather than let the whole comment fail to post.
+          const GITHUB_COMMENT_LIMIT = 65536;
+          if (body.length > GITHUB_COMMENT_LIMIT && detailsBlock) {
+            const withoutDetails = bodyLines.filter((line) => line !== detailsBlock);
+            withoutDetails.splice(
+              withoutDetails.length - 1,
+              0,
+              `_Findings list omitted - too large for a single PR comment (${findings.length} total). See the full report in the artifact linked below._`,
+              '',
+            );
+            body = withoutDetails.join('\n');
+          }
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+          }

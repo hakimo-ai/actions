@@ -12,7 +12,7 @@ inputs:
     description: ECR registry URL (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com)
     required: true
   ecr-repo:
-    description: ECR repository name (e.g. hakimo-vision/alarm-group-etl)
+    description: ECR repository name (e.g. company-vision/alarm-group-etl)
     required: true
   dockerfile:
     description: Path to Dockerfile

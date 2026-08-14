@@ -152,7 +152,7 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: /tmp/semgrep-image.tar
-        key: semgrep-image-1.172.0
+        key: semgrep-image-1.173.0
 
     - name: Load or pull Semgrep image
       if: steps.detect.outputs.sast == 'true'
@@ -160,7 +160,7 @@ runs:
       env:
         CACHE_HIT: ${{ steps.semgrep-cache.outputs.cache-hit }}
       run: |
-        image='semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b'
+        image='semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a'
         if [ "$CACHE_HIT" = "true" ]; then
           docker load -i /tmp/semgrep-image.tar
         else
@@ -175,7 +175,7 @@ runs:
       shell: bash
       run: |
         docker run --rm -v "$PWD:/github/workspace" -w /github/workspace \
-          semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b \
+          semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a \
           semgrep scan --config ${{ inputs.semgrep-config }} --json --output semgrep-results.json ${{ inputs.path }}
 
     - name: Summarize Semgrep findings
