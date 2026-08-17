@@ -1,0 +1,159 @@
+name: SBOM Scan
+description: Generate an SPDX/CycloneDX SBOM for a built container image, upload it as a release asset, and scan it for vulnerabilities.
+
+inputs:
+  role-to-assume:
+    description: IAM role ARN to assume via OIDC (needed to pull the image for inspection)
+    required: true
+  aws-region:
+    description: AWS region (e.g. us-west-2)
+    required: true
+  image:
+    description: Full image reference to generate an SBOM for (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com/company-vision/alarm-group-etl:v1.2.3)
+    required: true
+  sbom-name:
+    description: Base name for the SBOM file/artifact. Defaults to a sanitized version of the image reference
+    required: false
+    default: ''
+  format:
+    description: SBOM format - spdx-json or cyclonedx-json (anything else fails loudly rather than silently mislabeling the file extension)
+    required: false
+    default: spdx-json
+  severity-cutoff:
+    description: Minimum severity to treat as a finding (negligible, low, medium, high, critical)
+    required: false
+    default: medium
+  fail-on-findings:
+    description: Fail the job if the SBOM scan reports findings (a scan crash always fails the job regardless of this setting)
+    required: false
+    default: 'false'
+  upload-release-assets:
+    description: "Attach the SBOM to the current GitHub Release. Only meaningful on a release event - requires the caller's job to have 'contents: write' permission"
+    required: false
+    default: 'false'
+
+outputs:
+  sbom-path:
+    description: Absolute path to the generated SBOM file
+    value: ${{ steps.name.outputs.sbom-path }}
+  findings-count:
+    description: Number of vulnerability findings in the SBOM scan
+    value: ${{ steps.gate.outputs.total-findings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup ECR
+      id: setup-ecr
+      continue-on-error: true
+      uses: hakimo-ai/actions/setup-ecr@v1
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Compute SBOM file name
+      id: name
+      if: steps.setup-ecr.outcome == 'success'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SBOM_NAME: ${{ inputs.sbom-name }}
+        FORMAT: ${{ inputs.format }}
+      run: |
+        set -uo pipefail
+
+        case "$FORMAT" in
+          spdx-json) ext="spdx.json" ;;
+          cyclonedx-json) ext="cdx.json" ;;
+          *)
+            echo "::error::Unsupported format '$FORMAT' - this action only supports spdx-json or cyclonedx-json"
+            exit 1
+            ;;
+        esac
+
+        if [ -n "$SBOM_NAME" ]; then
+          base="$SBOM_NAME"
+        else
+          # sanitize the image ref into a filesystem/artifact-safe name: strip the
+          # registry host, replace remaining "/" and ":" with "-"
+          base="$(echo "$IMAGE" | sed -E 's#^[^/]+/##; s#[/:]#-#g')"
+        fi
+        # sanitize unconditionally, even for a caller-supplied sbom-name - GitHub
+        # artifact names reject "/:<>|*?\ and this also doubles as the file path.
+        base="$(echo "$base" | sed -E 's#[^A-Za-z0-9._-]+#-#g')"
+
+        name="${base}.${ext}"
+        echo "sbom-name=${name}" >> "$GITHUB_OUTPUT"
+        echo "sbom-path=${GITHUB_WORKSPACE}/${name}" >> "$GITHUB_OUTPUT"
+
+    - name: Generate SBOM
+      id: sbom
+      if: steps.name.outcome == 'success'
+      continue-on-error: true
+      uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+      with:
+        image: ${{ inputs.image }}
+        format: ${{ inputs.format }}
+        artifact-name: ${{ steps.name.outputs.sbom-name }}
+        output-file: ${{ steps.name.outputs.sbom-path }}
+        upload-artifact: true
+        upload-artifact-retention: 90
+        github-token: ${{ github.token }}
+        dependency-snapshot: false
+        upload-release-assets: ${{ inputs.upload-release-assets }}
+
+    - name: Scan SBOM
+      id: scan
+      if: steps.sbom.outcome == 'success'
+      continue-on-error: true
+      uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e  # v6.5.1
+      with:
+        sbom: ${{ steps.name.outputs.sbom-path }}
+        output-format: json
+        output-file: sbom-scan-results.json
+        severity-cutoff: ${{ inputs.severity-cutoff }}
+        fail-build: 'false'
+
+    - name: Evaluate findings
+      id: gate
+      if: always()
+      shell: bash
+      env:
+        SETUP_ECR_OUTCOME: ${{ steps.setup-ecr.outcome }}
+        NAME_OUTCOME: ${{ steps.name.outcome }}
+        SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+        SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        if [ "$SETUP_ECR_OUTCOME" != "success" ]; then
+          echo "::error::AWS/ECR setup failed - see the 'Setup ECR' step above"
+          echo "total-findings=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        if [ "$NAME_OUTCOME" != "success" ]; then
+          echo "::error::Could not compute the SBOM file name - see the 'Compute SBOM file name' step above"
+          echo "total-findings=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        if [ "$SBOM_OUTCOME" != "success" ]; then
+          echo "::error::SBOM generation failed - see the 'Generate SBOM' step above"
+          echo "total-findings=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        if [ "$SCAN_OUTCOME" != "success" ]; then
+          echo "::error::SBOM vulnerability scan failed - see the 'Scan SBOM' step above"
+          echo "total-findings=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        count=$(jq '.matches | length' sbom-scan-results.json 2>/dev/null || echo 0)
+        echo "total-findings=$count" >> "$GITHUB_OUTPUT"
+        echo "SBOM scan found $count finding(s) at or above severity-cutoff" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$count" -gt 0 ]; then
+          echo "::error::SBOM scan found $count finding(s) at or above severity-cutoff"
+          exit 1
+        fi

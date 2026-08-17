@@ -1,0 +1,28 @@
+name: PR Label Check
+description: Fail if a pull request has no labels assigned.
+
+inputs:
+  hint:
+    description: Extra hint text shown when no labels are found
+    required: false
+    default: 'Add a label (e.g. fix, feat, chore) or use a conventional-commit prefix in your PR title if this repo auto-labels from that.'
+
+runs:
+  using: composite
+  steps:
+    - name: Get PR labels
+      id: pr-labels
+      uses: joerick/pr-labels-action@0543b277721e852d821c6738d449f2f4dea03d5f  # v1.0.9
+
+    - name: Verify PR has at least one label
+      shell: bash
+      env:
+        LABELS: ${{ steps.pr-labels.outputs.labels }}
+        HINT: ${{ inputs.hint }}
+      run: |
+        if [ -n "$LABELS" ]; then
+          echo "PR has labels: $LABELS"
+        else
+          echo "::error::No labels found on this PR. $HINT"
+          exit 1
+        fi
