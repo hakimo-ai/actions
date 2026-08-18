@@ -12,11 +12,11 @@ Extracted from a working production job in `ai-engine/tag_bump.yml` (matrix over
 
 | Step | What happens |
 |---|---|
-| 1. Setup ECR | Calls [`hakimo-ai/actions/setup-ecr@v1`](../setup-ecr/README.md) internally — needed because `anchore/sbom-action` has to pull `image` from the registry to inspect it. |
+| 1. Setup ECR | Calls [`hakimo-ai/actions/setup-aws@v1`](../setup-aws/README.md) internally — needed because `anchore/sbom-action` has to pull `image` from the registry to inspect it. |
 | 2. Compute SBOM file name | Validates `format` (only `spdx-json`/`cyclonedx-json` are supported — anything else fails loudly here instead of silently mislabeling the output file's extension later). Derives a filesystem/artifact-safe base name from either `sbom-name` (if given) or a sanitized version of `image`, then emits the real absolute path once — every later step and the action's own `sbom-path` output use that same value directly, nothing re-derives it. |
 | 3. Generate SBOM | `anchore/sbom-action` produces the SBOM file, uploads it as a workflow artifact, and (if `upload-release-assets: 'true'`) attaches it to the current GitHub Release. |
 | 4. Scan SBOM | `anchore/scan-action` (the same tool `security-scan` uses for Grype, in the mode that scans an existing SBOM document instead of a live path) — `output-format: json` so findings are machine-parseable, `fail-build: 'false'` so a dirty scan doesn't itself crash the step. |
-| 5. Evaluate findings (gate) | Checks all four prior steps' outcomes individually (`setup-ecr`/`name`/`sbom`/`scan`) and fails the job with a specific, accurate error naming which one broke if any of them didn't succeed — **regardless of `fail-on-findings`**. Only fails on findings (not crashes) when `fail-on-findings: true` and the scan actually found something at or above `severity-cutoff`. |
+| 5. Evaluate findings (gate) | Checks all four prior steps' outcomes individually (`setup-aws`/`name`/`sbom`/`scan`) and fails the job with a specific, accurate error naming which one broke if any of them didn't succeed — **regardless of `fail-on-findings`**. Only fails on findings (not crashes) when `fail-on-findings: true` and the scan actually found something at or above `severity-cutoff`. |
 
 This is a single-image action — for a matrix of images (like `ai-engine`'s 3), the caller keeps its own `strategy: matrix` at the job level and calls `sbom-scan` once per matrix entry, the same way a caller would call `docker-build-push` once per Dockerfile.
 
@@ -68,6 +68,6 @@ jobs:
 ## Security guardrails
 
 - **Static analysis only — this action doesn't execute the image's contents.** `anchore/sbom-action`/`anchore/scan-action` inspect image layers and manifests; they don't run the image. Meaningfully lower-risk than [`lint-check`](../lint-check/README.md), similar profile to [`security-scan`](../security-scan/README.md).
-- **This action authenticates to AWS and pulls a real image**, same guardrail as `setup-ecr`: everything downstream in the same job has access to the AWS session it creates. Don't run untrusted code in the same job after this step.
+- **This action authenticates to AWS and pulls a real image**, same guardrail as `setup-aws`: everything downstream in the same job has access to the AWS session it creates. Don't run untrusted code in the same job after this step.
 - **An SBOM is a disclosure by design — that's its whole purpose**, but it's a broader one than `security-scan`'s PR comment: an SBOM lists every dependency and version in the shipped image, not just the ones with findings. If `upload-release-assets: 'true'`, that document becomes a public Release asset (on a public repo) or is visible to anyone with release-read access (on a private one) — make sure that's the intended audience before enabling it, independent of whether any vulnerabilities were found.
 - **`sbom-name`, if you set it explicitly, is still sanitized** (stripped to `[A-Za-z0-9._-]`) before being used as both a GitHub artifact name and a file path — but don't rely on that as an input-validation boundary for anything beyond this action's own file-naming needs.

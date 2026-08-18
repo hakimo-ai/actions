@@ -61,6 +61,7 @@ All versions stay on the same major as `ai-engine`'s existing workflows to avoid
 
 | External action | Version | Full commit SHA |
 |----------------|---------|----------------|
+| `actions/checkout` *(setup-aws)* | v4.2.2 | `11bd71901bbe5b1630ceea73d27597364c9af683` |
 | `aws-actions/configure-aws-credentials` | v6.2.3 | `e6de054238d6b7531b4efff3b6587d9aade6a06c` |
 | `aws-actions/amazon-ecr-login` | v2.1.6 | `b040164c4934333d597f3f9c67502ff28f814e9c` |
 | `docker/metadata-action` | v6.2.0 | `dc802804100637a589fabce1cb79ff13a1411302` |
@@ -93,9 +94,9 @@ All versions stay on the same major as `ai-engine`'s existing workflows to avoid
 
 Each action has its own detailed README covering how it works step by step, full inputs/outputs, and — since this repo is public — an action-specific **Security guardrails** section. Start there before wiring one of these into a workflow; the summaries below are just enough to pick the right action.
 
-### [`setup-ecr`](setup-ecr/README.md)
+### [`setup-aws`](setup-aws/README.md)
 
-Wraps `configure-aws-credentials` + `amazon-ecr-login` into a single step. Used anywhere a workflow needs AWS/ECR access without doing a full Docker build. Requires `id-token: write`.
+Bundles checkout + `configure-aws-credentials` + `amazon-ecr-login` into a single step. Replaces the three-step boilerplate that every workflow needed before any AWS or Docker operation. Requires `id-token: write`.
 
 ```yaml
 permissions:
@@ -103,17 +104,18 @@ permissions:
   contents: read
 
 steps:
-  - uses: hakimo-ai/actions/setup-ecr@v1
+  - uses: hakimo-ai/actions/setup-aws@v1
     with:
       role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
       aws-region: ${{ vars.AWS_REGION }}
+      fetch-depth: '0'   # optional, default is 1
 ```
 
 ---
 
 ### [`docker-build-push`](docker-build-push/README.md)
 
-Full ECR auth + Docker metadata + build + push in one step (internally calls `setup-ecr`). Replaces the 5-step boilerplate that used to be copy-pasted across every `build-docker-*.yml` in `ai-engine`.
+Full ECR auth + Docker metadata + build + push in one step (internally calls `setup-aws`). Replaces the 5-step boilerplate that used to be copy-pasted across every `build-docker-*.yml` in `ai-engine`.
 
 ```yaml
 permissions:
@@ -161,7 +163,7 @@ steps:
 
 ### [`lint-check`](lint-check/README.md)
 
-Language-aware lint/format check — Ruff (Python), ESLint + Prettier (Node, when configured), cargo fmt + clippy (Rust), yamllint. Same PR-comment pattern as `security-scan`. **Unlike `security-scan`, this action executes target-repo code** (`npm ci`, `cargo` compilation) — read its [security guardrails](lint-check/README.md#security-guardrails) before using it on anything that might check out untrusted content.
+Language-aware lint/format + deep Python checks — Ruff (Python format + lint), mypy (type checking), pylint (error-mode), ESLint + Prettier (Node, when configured), cargo fmt + clippy (Rust), yamllint. Same PR-comment pattern as `security-scan`. **Unlike `security-scan`, this action executes target-repo code** (`npm ci`, `cargo` compilation, `pip install`) — read its [security guardrails](lint-check/README.md#security-guardrails) before using it on anything that might check out untrusted content.
 
 ```yaml
 permissions:
@@ -174,6 +176,8 @@ steps:
   - uses: hakimo-ai/actions/lint-check@v1
     with:
       path: .
+      requirements-file: requirements-base.txt   # optional — needed for mypy/pylint to resolve imports
+      pylint-mode: errors-only                    # default; use 'full' for all checks
 ```
 
 ---
@@ -220,6 +224,6 @@ steps:
 
 All actions in this repo share a single version tag (`v1`, `v2`, …). When any action changes, the tag is bumped and callers are updated in a follow-up PR in `ai-engine`.
 
-- Always pin callers to a tag: `uses: hakimo-ai/actions/setup-ecr@v1`
+- Always pin callers to a tag: `uses: hakimo-ai/actions/setup-aws@v1`
 - Never use `@main` — a breaking change on main would affect every in-flight run immediately with no warning
 - To release a new version: commit to `main`, then `git tag v2 && git push origin v2`

@@ -30,6 +30,18 @@ inputs:
     description: Max number of individual findings (most severe first) to list in the PR comment's collapsed detail section
     required: false
     default: '10'
+  requirements-file:
+    description: Path to a requirements file (relative to `path`) to install before running mypy and pylint. Leave empty to skip dependency install (mypy/pylint will still run but may miss third-party type stubs).
+    required: false
+    default: ''
+  mypy-args:
+    description: Extra args to pass to mypy. Defaults to --ignore-missing-imports which is safe when not all deps are installed.
+    required: false
+    default: '--ignore-missing-imports'
+  pylint-mode:
+    description: Pylint severity mode. 'errors-only' runs pylint -E (fast, no false positives). 'full' runs all checks.
+    required: false
+    default: 'errors-only'
 
 outputs:
   findings-count:
@@ -138,6 +150,94 @@ runs:
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Ruff findings (format + lint): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Install Python dependencies for mypy/pylint
+      if: steps.detect.outputs.python == 'true' && inputs.requirements-file != ''
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: pip install --quiet -r "${{ inputs.requirements-file }}" || true
+
+    - name: Run mypy
+      id: mypy
+      if: steps.detect.outputs.python == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        pip install --quiet mypy==1.16.1
+
+        set +e
+        mypy ${{ inputs.mypy-args }} --output=json . > mypy-results.json 2>mypy-stderr.txt
+        code=$?
+        set -e
+
+        # mypy: 0 = clean, 1 = type errors found, 2 = fatal error (config/crash).
+        if [ "$code" -gt 1 ]; then
+          echo "::error::mypy exited abnormally ($code) - see logs"
+          cat mypy-stderr.txt >&2
+          exit 1
+        fi
+
+    - name: Summarize mypy findings
+      id: mypy-summary
+      if: always() && steps.detect.outputs.python == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.mypy.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "mypy: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq -s 'length' mypy-results.json 2>/dev/null || grep -c '"severity"' mypy-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "mypy findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run pylint
+      id: pylint
+      if: steps.detect.outputs.python == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        pip install --quiet pylint==3.3.7
+
+        pylint_args=""
+        if [ "${{ inputs.pylint-mode }}" = "errors-only" ]; then
+          pylint_args="-E"
+        fi
+
+        set +e
+        pylint $pylint_args --output-format=json2 . > pylint-results.json 2>pylint-stderr.txt
+        code=$?
+        set -e
+
+        # pylint exit codes are bitmasks: 0=ok, 1=fatal, 2=error, 4=warning, 8=refactor, 16=convention, 32=usage.
+        # Codes 1 and 32 are genuine crashes. Everything else means findings were reported.
+        if [ $((code & 1)) -ne 0 ] || [ $((code & 32)) -ne 0 ]; then
+          echo "::error::pylint exited abnormally ($code) - see logs"
+          cat pylint-stderr.txt >&2
+          exit 1
+        fi
+
+    - name: Summarize pylint findings
+      id: pylint-summary
+      if: always() && steps.detect.outputs.python == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.pylint.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "pylint: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq '.messages | length' pylint-results.json 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "pylint findings: $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Setup Node
@@ -352,6 +452,10 @@ runs:
       env:
         RUFF_COUNT: ${{ steps.ruff-summary.outputs.count }}
         RUFF_FAILED: ${{ steps.ruff-summary.outputs.failed }}
+        MYPY_COUNT: ${{ steps.mypy-summary.outputs.count }}
+        MYPY_FAILED: ${{ steps.mypy-summary.outputs.failed }}
+        PYLINT_COUNT: ${{ steps.pylint-summary.outputs.count }}
+        PYLINT_FAILED: ${{ steps.pylint-summary.outputs.failed }}
         ESLINT_COUNT: ${{ steps.eslint-summary.outputs.count }}
         ESLINT_FAILED: ${{ steps.eslint-summary.outputs.failed }}
         PRETTIER_COUNT: ${{ steps.prettier-summary.outputs.count }}
@@ -362,11 +466,13 @@ runs:
         YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
-        total=$(( ${RUFF_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${YAML_COUNT:-0} ))
+        total=$(( ${RUFF_COUNT:-0} + ${MYPY_COUNT:-0} + ${PYLINT_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${YAML_COUNT:-0} ))
 
         failed_scanners=""
         any_failed="false"
         for pair in "Ruff:${RUFF_FAILED:-false}" \
+                    "mypy:${MYPY_FAILED:-false}" \
+                    "pylint:${PYLINT_FAILED:-false}" \
                     "ESLint:${ESLINT_FAILED:-false}" \
                     "Prettier:${PRETTIER_FAILED:-false}" \
                     "cargo fmt/clippy:${RUST_FAILED:-false}" \
@@ -419,6 +525,10 @@ runs:
       uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
       env:
         RUFF_FAILED: ${{ steps.ruff-summary.outputs.failed }}
+        MYPY_COUNT: ${{ steps.mypy-summary.outputs.count }}
+        MYPY_FAILED: ${{ steps.mypy-summary.outputs.failed }}
+        PYLINT_COUNT: ${{ steps.pylint-summary.outputs.count }}
+        PYLINT_FAILED: ${{ steps.pylint-summary.outputs.failed }}
         ESLINT_FAILED: ${{ steps.eslint-summary.outputs.failed }}
         PRETTIER_FAILED: ${{ steps.prettier-summary.outputs.failed }}
         RUST_FAILED: ${{ steps.rust-summary.outputs.failed }}
@@ -555,6 +665,16 @@ runs:
           rows.push(
             process.env.PYTHON_RAN === 'true'
               ? scannerRow('Ruff (Python format + lint)', countByTool('Ruff'), process.env.RUFF_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.PYTHON_RAN === 'true'
+              ? scannerRow('mypy (type check)', parseInt(process.env.MYPY_COUNT || '0', 10), process.env.MYPY_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.PYTHON_RAN === 'true'
+              ? scannerRow('pylint (error check)', parseInt(process.env.PYLINT_COUNT || '0', 10), process.env.PYLINT_FAILED)
               : null,
           );
           rows.push(

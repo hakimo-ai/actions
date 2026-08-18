@@ -40,7 +40,7 @@ runs:
   using: composite
   steps:
     - name: Setup ECR
-      uses: hakimo-ai/actions/setup-ecr@v1
+      uses: hakimo-ai/actions/setup-aws@v1
       with:
         role-to-assume: ${{ inputs.role-to-assume }}
         aws-region: ${{ inputs.aws-region }}
