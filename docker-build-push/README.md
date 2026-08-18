@@ -4,7 +4,7 @@ Full ECR auth + Docker metadata + build + push, in one step.
 
 ## What it does
 
-Replaces the 5-step boilerplate (`configure-aws-credentials` → `amazon-ecr-login` → `docker/metadata-action` → `setup-docker-builder` → `build-push-action`) that used to be copy-pasted across every `build-docker-*.yml` workflow in `ai-engine` (15 of them at last count). Internally calls [`setup-aws`](../setup-aws/README.md), so a caller using this action does **not** need a separate `setup-aws` step.
+Replaces the 5-step boilerplate (`configure-aws-credentials` → `amazon-ecr-login` → `docker/metadata-action` → `setup-docker-builder` → `build-push-action`) that tends to be copy-pasted across every per-service build workflow in a consumer repo. Internally calls [`setup-aws`](../setup-aws/README.md), so a caller using this action does **not** need a separate `setup-aws` step.
 
 ## How it works
 

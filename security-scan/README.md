@@ -12,7 +12,7 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 |---|---|
 | 1. Detect project languages | A `find`-based helper checks the target `path` for Python/Node/Rust/C# manifest files and IaC markers (`Dockerfile`, `*.tf`, `kustomization.y*ml`), and sets a boolean per language plus a combined `sast` flag (true if any of Python/Node/Rust/C# is present). |
 | 2. Map severity threshold | Converts the single `severity-cutoff` input into the uppercase, comma-separated list Trivy expects (Grype takes the same value directly). |
-| 3. Run Grype | `anchore/scan-action` in path-scan mode — dependency CVEs. Auto-detects Python, npm/yarn, Cargo, and NuGet manifests via Syft's catalogers. Matches the tool already used for image scanning in `ai-engine/tag_bump.yml`, so there's one CVE-scanning tool org-wide instead of introducing a second. |
+| 3. Run Grype | `anchore/scan-action` in path-scan mode — dependency CVEs. Auto-detects Python, npm/yarn, Cargo, and NuGet manifests via Syft's catalogers. Matches the tool already used for image scanning in this org's release workflows, so there's one CVE-scanning tool org-wide instead of introducing a second. |
 | 4. Summarize Grype findings | Parses the JSON report into a finding count; if Grype crashed (not "found nothing," an actual tool error), marks the lane as failed instead of reporting a false zero. |
 | 5. Run Trivy | `fs` scan with `scanners: secret,misconfig` — secrets and IaC/Dockerfile/K8s misconfig in one pass (vuln scanning is Grype's job, so Trivy's `vuln` scanner is intentionally not enabled). This is what actually covers `deploy`, which is almost entirely Kustomize/K8s YAML. |
 | 6. Summarize Trivy findings | Same crash-vs-clean distinction as step 4. |

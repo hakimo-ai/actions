@@ -4,7 +4,7 @@ Fail a job if a pull request has no labels assigned.
 
 ## What it does
 
-Extracted from a near-identical `pr-label-check.yml` duplicated in **3 of 4** consumer repos (`ai-engine`, `vision`, `hakimo-ui`) — all wrapping `joerick/pr-labels-action` with the same "at least one label" check, but pinned to a **floating tag**, inconsistently (`@v1.0.6` in one repo, `@v1.0.9` in the other two). This action fixes both the duplication and the SHA-pinning gap in one move — a version bump here now goes through review instead of a maintainer silently redirecting a tag underneath every caller at once.
+Extracted from a near-identical `pr-label-check.yml` duplicated across several consumer repos — all wrapping `joerick/pr-labels-action` with the same "at least one label" check, but pinned to a **floating tag**, inconsistently (`@v1.0.6` in some repos, `@v1.0.9` in others). This action fixes both the duplication and the SHA-pinning gap in one move — a version bump here now goes through review instead of a maintainer silently redirecting a tag underneath every caller at once.
 
 Deliberately minimal by design: no severity levels, no PR comment, no findings gate like `security-scan`/`lint-check`/`sbom-scan` have. The whole point of this action *is* the check — there's no broader "scan" concept that needs a crash-vs-findings distinction.
 

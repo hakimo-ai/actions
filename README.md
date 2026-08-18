@@ -57,7 +57,7 @@ SHAs are not human-readable on their own, so every pin in this repo includes a c
 
 ## Pinned dependency versions
 
-All versions stay on the same major as `ai-engine`'s existing workflows to avoid breaking changes on migration.
+All versions target broadly compatible, non-freshly-cut majors to avoid breaking changes on migration.
 
 | External action | Version | Full commit SHA |
 |----------------|---------|----------------|
@@ -80,7 +80,7 @@ All versions stay on the same major as `ai-engine`'s existing workflows to avoid
 | `joerick/pr-labels-action` | v1.0.9 | `0543b277721e852d821c6738d449f2f4dea03d5f` |
 | `actions/checkout` *(callers)* | v4.4.0 | `11d5960a326750d5838078e36cf38b85af677262` |
 
-`actions/setup-python` and `actions/setup-node` are dependencies introduced by `lint-check` — nothing in the org uses either today, so there's no existing major to match. Pinned to the latest release on the most mature major (v5 / v6) rather than the freshly-cut v6/v7 majors with zero patch releases yet, for the same "won't break" reasoning as matching `ai-engine`'s existing majors elsewhere in this table. `dtolnay/rust-toolchain` doesn't use semver releases — it's the actively maintained, MIT-licensed replacement for the archived `actions-rs/toolchain`, and its own docs recommend pinning `@v1` (a maintained moving tag); pinned here to the commit `v1` currently resolves to, same SHA-pinning rationale as everything else. `lint-check` also installs `ruff`/`yamllint` from PyPI, version-pinned (not SHA-pinned — PyPI has no equivalent); see [`lint-check`'s README](lint-check/README.md#security-guardrails) for the caveat that implies. `anchore/sbom-action` is pre-1.0 (no stable major yet); `ai-engine/tag_bump.yml`'s own inline pin is `v0.20.5`, several minor releases behind — that pin was never audited, not a deliberate version choice, so `sbom-scan` uses the latest release (`v0.24.0`) instead of matching it. `joerick/pr-labels-action` is new — the 3 repos already using it inline are inconsistently pinned to `v1.0.6`/`v1.0.9` on a floating tag (not a SHA); this repo standardizes on `v1.0.9`, SHA-pinned.
+`actions/setup-python` and `actions/setup-node` are dependencies introduced by `lint-check` — nothing in the org uses either today, so there's no existing major to match. Pinned to the latest release on the most mature major (v5 / v6) rather than the freshly-cut v6/v7 majors with zero patch releases yet, for the same "won't break" reasoning as the table above. `dtolnay/rust-toolchain` doesn't use semver releases — it's the actively maintained, MIT-licensed replacement for the archived `actions-rs/toolchain`, and its own docs recommend pinning `@v1` (a maintained moving tag); pinned here to the commit `v1` currently resolves to, same SHA-pinning rationale as everything else. `lint-check` also installs `ruff`/`yamllint` from PyPI, version-pinned (not SHA-pinned — PyPI has no equivalent); see [`lint-check`'s README](lint-check/README.md#security-guardrails) for the caveat that implies. `anchore/sbom-action` is pre-1.0 (no stable major yet); pinned to the latest release (`v0.24.0`). `joerick/pr-labels-action` is new — existing consumer repos are inconsistently pinned to `v1.0.6`/`v1.0.9` on a floating tag (not a SHA); this repo standardizes on `v1.0.9`, SHA-pinned.
 
 **How to update a dependency:**
 1. Find the new release tag on the action's GitHub repo
@@ -115,7 +115,7 @@ steps:
 
 ### [`docker-build-push`](docker-build-push/README.md)
 
-Full ECR auth + Docker metadata + build + push in one step (internally calls `setup-aws`). Replaces the 5-step boilerplate that used to be copy-pasted across every `build-docker-*.yml` in `ai-engine`.
+Full ECR auth + Docker metadata + build + push in one step (internally calls `setup-aws`). Replaces the 5-step boilerplate that tends to be copy-pasted across every per-service build workflow in a consumer repo.
 
 ```yaml
 permissions:
@@ -184,7 +184,7 @@ steps:
 
 ### [`sbom-scan`](sbom-scan/README.md)
 
-Generate a real SBOM for a built container image, attach it to a GitHub Release, and scan it for vulnerabilities. Extracted from a working production job in `ai-engine/tag_bump.yml` — not the same thing as `security-scan` (source-scan on every PR, no image/SBOM involved); this one runs at release time against a built image and produces an actual compliance artifact.
+Generate a real SBOM for a built container image, attach it to a GitHub Release, and scan it for vulnerabilities. Not the same thing as `security-scan` (source-scan on every PR, no image/SBOM involved); this one runs at release time against a built image and produces an actual compliance artifact.
 
 ```yaml
 permissions:
@@ -204,7 +204,7 @@ steps:
 
 ### [`pr-label-check`](pr-label-check/README.md)
 
-Fail a job if a PR has no labels. Extracted from a near-identical workflow duplicated in 3 of 4 consumer repos, all pinned to a floating (not SHA-pinned) tag inconsistently — collapses the duplication and fixes the pinning gap in one move.
+Fail a job if a PR has no labels. Extracted from a near-identical workflow duplicated across several consumer repos, all pinned to a floating (not SHA-pinned) tag inconsistently — collapses the duplication and fixes the pinning gap in one move.
 
 ```yaml
 on:
@@ -222,7 +222,7 @@ steps:
 
 ## Versioning
 
-All actions in this repo share a single version tag (`v1`, `v2`, …). When any action changes, the tag is bumped and callers are updated in a follow-up PR in `ai-engine`.
+All actions in this repo share a single version tag (`v1`, `v2`, …). When any action changes, the tag is bumped and callers are updated in a follow-up PR in the consuming repo.
 
 - Always pin callers to a tag: `uses: hakimo-ai/actions/setup-aws@v1`
 - Never use `@main` — a breaking change on main would affect every in-flight run immediately with no warning

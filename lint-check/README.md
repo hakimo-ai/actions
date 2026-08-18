@@ -4,7 +4,7 @@ Language-aware lint/format check: detects what's actually in the target repo and
 
 ## What it does
 
-Runs Ruff + mypy + pylint (Python), ESLint + Prettier (Node, only when actually configured), cargo fmt + clippy (Rust), and yamllint against whatever languages are detected — instead of assuming one stack across `ai-engine`, `vision`, `hakimo-ui`, and `deploy`. C#, Go, and C++ are detected but intentionally **not** linted; see "Why C#/Go/C++ are out of scope" below.
+Runs Ruff + mypy + pylint (Python), ESLint + Prettier (Node, only when actually configured), cargo fmt + clippy (Rust), and yamllint against whatever languages are detected — without assuming a single stack across all consumer repos. C#, Go, and C++ are detected but intentionally **not** linted; see "Why C#/Go/C++ are out of scope" below.
 
 ## How it works
 
@@ -24,8 +24,8 @@ Runs Ruff + mypy + pylint (Python), ESLint + Prettier (Node, only when actually 
 
 ## Why C#/Go/C++ are out of scope
 
-- **C#**: the only C# code (`ai-engine/integ/{genetec,velocity,milestone}`) builds via proprietary SDK installers on a self-hosted **Windows** runner (`cs-build.yml`). There's no way for a generic Linux composite action to restore or analyze it.
-- **Go**/**C++**: both already have dedicated per-repo tooling (`dominikh/staticcheck-action` in `go-build.yml`, `clang-format` in `cpp_workflow.yml`) and represent a handful of files each — not worth centralizing.
+- **C#**: C# code in consumer repos typically builds via proprietary SDK installers on self-hosted **Windows** runners. There's no way for a generic Linux composite action to restore or analyze it.
+- **Go**/**C++**: both typically have dedicated per-repo tooling (`dominikh/staticcheck-action`, `clang-format`) and represent a handful of files each — not worth centralizing.
 
 When detected, all three are named explicitly in the PR comment rather than silently ignored, so the gap is visible instead of assumed-covered.
 

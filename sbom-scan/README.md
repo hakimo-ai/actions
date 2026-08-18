@@ -4,7 +4,7 @@ Generate a real, downloadable SBOM for a built container image, attach it to a G
 
 ## What it does
 
-Extracted from a working production job in `ai-engine/tag_bump.yml` (matrix over 3 images) — not a new design, a reusable version of existing logic, same story as [`docker-build-push`](../docker-build-push/README.md) extracting `ai-engine`'s 15 `build-docker-*.yml` files.
+Extracted from a working production release workflow — not a new design, a reusable version of existing logic, same story as [`docker-build-push`](../docker-build-push/README.md) centralizing per-service build boilerplate.
 
 **This is not the same thing as [`security-scan`](../security-scan/README.md), even though both use Grype.** `security-scan` runs in path-scan mode against the checked-out repo's dependency manifests, on every PR — no image, no SBOM artifact, just a PR comment. `sbom-scan` runs in image-scan mode: it pulls a *built and pushed* container image, generates an actual SPDX/CycloneDX SBOM document (a real compliance/audit deliverable — "here's exactly what's in this released image"), uploads it as a workflow artifact and, optionally, a GitHub Release asset, and only then scans that SBOM. Different trigger point (release time, not PR time), different output, genuinely new capability `security-scan` doesn't provide. The overlap in CVE-finding between the two is a feature (defense in depth — catch it again at release in case something changed since merge), not a bug.
 
@@ -18,7 +18,7 @@ Extracted from a working production job in `ai-engine/tag_bump.yml` (matrix over
 | 4. Scan SBOM | `anchore/scan-action` (the same tool `security-scan` uses for Grype, in the mode that scans an existing SBOM document instead of a live path) — `output-format: json` so findings are machine-parseable, `fail-build: 'false'` so a dirty scan doesn't itself crash the step. |
 | 5. Evaluate findings (gate) | Checks all four prior steps' outcomes individually (`setup-aws`/`name`/`sbom`/`scan`) and fails the job with a specific, accurate error naming which one broke if any of them didn't succeed — **regardless of `fail-on-findings`**. Only fails on findings (not crashes) when `fail-on-findings: true` and the scan actually found something at or above `severity-cutoff`. |
 
-This is a single-image action — for a matrix of images (like `ai-engine`'s 3), the caller keeps its own `strategy: matrix` at the job level and calls `sbom-scan` once per matrix entry, the same way a caller would call `docker-build-push` once per Dockerfile.
+This is a single-image action — for a matrix of images, the caller keeps its own `strategy: matrix` at the job level and calls `sbom-scan` once per matrix entry, the same way a caller would call `docker-build-push` once per Dockerfile.
 
 ## Inputs
 
