@@ -220,6 +220,69 @@ steps:
 
 ---
 
+### [`quality-gate-check`](quality-gate-check/README.md)
+
+Run a quality gate script inside a Docker image with the `continue-on-error` / re-raise pattern — captures the metric output even when the gate fails so downstream steps always have numbers. Call it once per gate (coverage, pylint); the caller decides when to fail.
+
+```yaml
+permissions:
+  contents: read
+
+steps:
+  # ... checkout, build image, run tests first ...
+
+  - id: coverage-gate
+    uses: hakimo-ai/actions/quality-gate-check@v1
+    with:
+      docker-image: ${{ env.DOCKER }}
+      gate-script: ci_scripts/check_coverage_gate.sh
+      output-file: coverage_pct.txt
+      baseline-var: COVERAGE_BASELINE
+      baseline-value: ${{ steps.baseline.outputs.coverage_baseline }}
+
+  - id: pylint-gate
+    uses: hakimo-ai/actions/quality-gate-check@v1
+    with:
+      docker-image: ${{ env.DOCKER }}
+      gate-script: ci_scripts/check_pylint_gate.sh
+      output-file: pylint_score.txt
+      baseline-var: PYLINT_BASELINE
+      baseline-value: ${{ steps.baseline.outputs.pylint_baseline }}
+
+  - name: Fail if any gate failed
+    if: always() && (steps.coverage-gate.outputs.passed != 'success' || steps.pylint-gate.outputs.passed != 'success')
+    run: exit 1
+```
+
+---
+
+### [`post-quality-summary`](post-quality-summary/README.md)
+
+Post or update the quality gate results as a PR comment. Reads `quality_baseline.json` for tolerances, upserts a single comment (paginated search — never duplicates on active PRs), and shows a context-sensitive footer. No-op on non-pull-request events.
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+
+steps:
+  - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+  - uses: hakimo-ai/actions/post-quality-summary@v1
+    with:
+      github-token:      ${{ secrets.GITHUB_TOKEN }}
+      coverage-pct:      ${{ needs.lint-test.outputs.coverage_pct }}
+      pylint-score:      ${{ needs.lint-test.outputs.pylint_score }}
+      coverage-passed:   ${{ needs.lint-test.outputs.coverage_passed }}
+      pylint-passed:     ${{ needs.lint-test.outputs.pylint_passed }}
+      baseline-coverage: ${{ needs.lint-test.outputs.baseline_coverage }}
+      baseline-pylint:   ${{ needs.lint-test.outputs.baseline_pylint }}
+      baseline-source:   ${{ needs.lint-test.outputs.baseline_source }}
+      baseline-commit:   ${{ needs.lint-test.outputs.baseline_commit }}
+```
+
+---
+
 ## Versioning
 
 All actions in this repo share a single version tag (`v1`, `v2`, …). When any action changes, the tag is bumped and callers are updated in a follow-up PR in the consuming repo.

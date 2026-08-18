@@ -1,0 +1,152 @@
+name: Post Quality Gate Summary
+description: >
+  Post or update the quality gate results as a PR comment. Reads tolerances from
+  quality_baseline.json in the checked-out repo; baselines come from inputs (resolved
+  upstream via S3 or the committed seed). No-op on non-pull_request events.
+
+inputs:
+  github-token:
+    description: GitHub token with pull-requests:write permission
+    required: true
+  coverage-pct:
+    description: Measured coverage percentage (e.g. "87.3"). Empty string if the gate did not run.
+    required: false
+    default: ''
+  pylint-score:
+    description: Measured pylint score (e.g. "9.12"). Empty string if the gate did not run.
+    required: false
+    default: ''
+  coverage-passed:
+    description: "'success' or 'failure' — the outcome of the coverage gate step"
+    required: false
+    default: ''
+  pylint-passed:
+    description: "'success' or 'failure' — the outcome of the pylint gate step"
+    required: false
+    default: ''
+  baseline-coverage:
+    description: Coverage baseline value (numeric string). Falls back to quality_baseline.json seed if empty or non-numeric.
+    required: false
+    default: ''
+  baseline-pylint:
+    description: Pylint baseline value (numeric string). Falls back to quality_baseline.json seed if empty or non-numeric.
+    required: false
+    default: ''
+  baseline-source:
+    description: "'published' if the baseline came from S3, anything else renders as the committed seed. Used in the comment footer."
+    required: false
+    default: ''
+  baseline-commit:
+    description: Short SHA of the commit that last raised the published baseline, shown in the comment footer when baseline-source is 'published'.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Post or update quality gate summary
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+      env:
+        COVERAGE_PCT: ${{ inputs.coverage-pct }}
+        PYLINT_SCORE: ${{ inputs.pylint-score }}
+        COVERAGE_PASSED: ${{ inputs.coverage-passed }}
+        PYLINT_PASSED: ${{ inputs.pylint-passed }}
+        BASELINE_COVERAGE: ${{ inputs.baseline-coverage }}
+        BASELINE_PYLINT: ${{ inputs.baseline-pylint }}
+        BASELINE_SOURCE: ${{ inputs.baseline-source }}
+        BASELINE_COMMIT: ${{ inputs.baseline-commit }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+
+          // Tolerances are policy and live in the committed file.
+          // Fall back to seed baselines when upstream resolution failed (lint-test
+          // cancelled, died before resolving, etc.) so we never render NaN.
+          const seed = JSON.parse(fs.readFileSync('quality_baseline.json', 'utf8'));
+          const num = (v, fallback) =>
+            Number.isFinite(parseFloat(v)) ? parseFloat(v) : fallback;
+          const baseline = {
+            coverage_percent: num(process.env.BASELINE_COVERAGE, seed.coverage_percent),
+            pylint_score:     num(process.env.BASELINE_PYLINT,    seed.pylint_score),
+            coverage_tolerance: seed.coverage_tolerance,
+            pylint_tolerance:   seed.pylint_tolerance,
+          };
+
+          const coverage = process.env.COVERAGE_PCT  || '';
+          const pylint   = process.env.PYLINT_SCORE   || '';
+          const covPass  = process.env.COVERAGE_PASSED === 'success';
+          const pylPass  = process.env.PYLINT_PASSED  === 'success';
+
+          const covCell   = coverage ? `${coverage}%`  : 'N/A';
+          const pylCell   = pylint   ? `${pylint}/10`  : 'N/A';
+          const covStatus = !coverage ? '⏭️ skipped' : (covPass ? '✅ pass' : '❌ fail');
+          const pylStatus = !pylint   ? '⏭️ skipped' : (pylPass ? '✅ pass' : '❌ fail');
+
+          const covBeat  = coverage && parseFloat(coverage) > baseline.coverage_percent;
+          const pylBeat  = pylint   && parseFloat(pylint)   > baseline.pylint_score;
+          const covGrace = coverage && covPass && parseFloat(coverage) < baseline.coverage_percent;
+          const pylGrace = pylint   && pylPass && parseFloat(pylint)   < baseline.pylint_score;
+
+          const covRan = coverage !== '';
+          const pylRan = pylint   !== '';
+
+          let footer = '';
+          if (!covRan || !pylRan) {
+            footer = '';
+          } else if (!covPass || !pylPass) {
+            footer = '⚠️ Oops - you lowered the bar. Add tests or fix pylint findings before merging.';
+          } else if (covBeat || pylBeat) {
+            footer = '🎉 Nice work - you raised the bar!';
+          } else if (covGrace || pylGrace) {
+            footer = '😬 Ohh - you passed with grace marks. Consider adding tests or improving pylint coverage.';
+          } else {
+            footer = '👍 Holding steady at the current baseline.';
+          }
+
+          const bodyLines = [
+            '## Quality Gate Summary',
+            '',
+            '| Gate | Current | Baseline | Tolerance | Status |',
+            '|------|---------|----------|-----------|--------|',
+            `| Coverage | ${covCell} | ${baseline.coverage_percent}% | ${baseline.coverage_tolerance ?? 'N/A'} | ${covStatus} |`,
+            `| Pylint   | ${pylCell} | ${baseline.pylint_score}/10  | ${baseline.pylint_tolerance ?? 'N/A'} | ${pylStatus} |`,
+          ];
+
+          const source = process.env.BASELINE_SOURCE === 'published'
+            ? `best measured on master${process.env.BASELINE_COMMIT ? `, last raised @ ${process.env.BASELINE_COMMIT}` : ''}`
+            : 'committed seed in quality_baseline.json';
+          bodyLines.push('', `<sub>Baseline: ${source}.</sub>`);
+          if (footer) bodyLines.push('', footer);
+
+          const body   = bodyLines.join('\n');
+          const marker = '## Quality Gate Summary';
+
+          // Paginate — a PR with >30 comments would silently miss the prior bot
+          // comment without this, creating a new one on every push instead of
+          // updating the existing one.
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo:  context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const existing = comments.find(
+            c => c.user.type === 'Bot' && c.body.includes(marker)
+          );
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }

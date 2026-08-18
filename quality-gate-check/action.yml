@@ -1,0 +1,57 @@
+name: Quality Gate Check
+description: >
+  Run a gate script inside a Docker image with the continue-on-error / re-raise pattern.
+  Captures the metric output file even when the gate fails, then exposes both the metric
+  value and the pass/fail result as outputs so the caller decides whether to fail the job.
+
+inputs:
+  docker-image:
+    description: Full image reference to run the gate inside (must already be pulled/available on the runner)
+    required: true
+  gate-script:
+    description: Path to the gate script inside the container, relative to the mounted workspace root (e.g. ci_scripts/check_coverage_gate.sh)
+    required: true
+  output-file:
+    description: File the gate script writes its metric value to, relative to the workspace root (e.g. coverage_pct.txt)
+    required: true
+  baseline-var:
+    description: Name of the environment variable to inject into the container (e.g. COVERAGE_BASELINE)
+    required: true
+  baseline-value:
+    description: Value to inject via baseline-var
+    required: true
+
+outputs:
+  value:
+    description: Metric value read from output-file. Empty string if the gate crashed before writing it.
+    value: ${{ steps.run.outputs.value }}
+  passed:
+    description: "'success' if the gate passed, 'failure' if it failed or crashed"
+    value: ${{ steps.capture.outputs.passed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run gate
+      id: run
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -uo pipefail
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE":/app \
+          -w /app \
+          -e "${{ inputs.baseline-var }}=${{ inputs.baseline-value }}" \
+          "${{ inputs.docker-image }}" bash -c "
+            git config --global --add safe.directory /app
+            bash ${{ inputs.gate-script }}
+          " || GATE_FAILED=1
+        VALUE=$(cat "$GITHUB_WORKSPACE/${{ inputs.output-file }}" 2>/dev/null || echo '')
+        echo "value=$VALUE" >> "$GITHUB_OUTPUT"
+        exit ${GATE_FAILED:-0}
+
+    - name: Capture gate outcome
+      id: capture
+      if: always()
+      shell: bash
+      run: echo "passed=${{ steps.run.outcome }}" >> "$GITHUB_OUTPUT"
