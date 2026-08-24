@@ -270,7 +270,7 @@ runs:
 
           const anyFailed = process.env.ANY_FAILED === 'true';
 
-          // --- Pull the actual top findings out of the JSON reports, most severe first ---
+          // --- Pull the actual findings out of the JSON reports ---
           const readJson = (file) => {
             try {
               return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -281,83 +281,123 @@ runs:
           const asArray = (v) => (Array.isArray(v) ? v : []);
 
           // Each tool has its own severity vocabulary (Grype: Critical/High/...,
-          // Trivy: CRITICAL/HIGH/..., Semgrep: ERROR/WARNING/INFO) — this rank is
-          // just for sorting the combined list, most severe first.
-          const SEVERITY_RANK = {
-            critical: 0, error: 0,
-            high: 1,
-            medium: 2, moderate: 2, warning: 2,
-            low: 3,
-            negligible: 4, info: 4,
-            unknown: 5,
+          // Trivy: CRITICAL/HIGH/..., Semgrep: ERROR/WARNING/INFO) - normalized
+          // into one 5-bucket scale so the header/table/emoji are consistent
+          // across all three scanners.
+          const SEVERITY_BUCKETS = {
+            critical: 'critical', error: 'critical',
+            high: 'high',
+            medium: 'medium', moderate: 'medium', warning: 'medium',
+            low: 'low',
+            negligible: 'unknown', info: 'unknown', unknown: 'unknown',
           };
-          const rank = (s) => SEVERITY_RANK[String(s || '').toLowerCase()] ?? 5;
+          const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3, unknown: 4 };
+          const SEVERITY_EMOJI = { critical: '\u{1F534}', high: '\u{1F7E0}', medium: '\u{1F7E1}', low: '\u{1F535}', unknown: '⚪' };
+          const bucket = (s) => SEVERITY_BUCKETS[String(s || '').toLowerCase()] ?? 'unknown';
 
           const findings = [];
-          const push = (tool, severity, text) => findings.push({ tool, severity: severity || 'Unknown', text });
+          const push = (tool, severity, rule, text) =>
+            findings.push({ tool, severity: bucket(severity), rule: rule || 'unknown', text });
 
           for (const m of asArray(readJson('grype-results.json')?.matches)) {
-            push('Grype', m.vulnerability?.severity, `**Grype** ${m.vulnerability?.id || 'unknown'} in \`${m.artifact?.name || '?'}@${m.artifact?.version || '?'}\``);
+            push('Grype', m.vulnerability?.severity, m.vulnerability?.id, `in \`${m.artifact?.name || '?'}@${m.artifact?.version || '?'}\``);
           }
 
           for (const r of asArray(readJson('trivy-results.json')?.Results)) {
             for (const s of asArray(r.Secrets)) {
-              push('Trivy', s.Severity, `**Trivy** secret \`${s.RuleID || s.Title || 'unknown'}\` in \`${r.Target || '?'}:${s.StartLine ?? '?'}\``);
+              push('Trivy', s.Severity, s.RuleID || s.Title, `in \`${r.Target || '?'}:${s.StartLine ?? '?'}\``);
             }
             for (const mc of asArray(r.Misconfigurations)) {
-              push('Trivy', mc.Severity, `**Trivy** \`${mc.ID || 'unknown'}\`: ${mc.Title || ''} in \`${r.Target || '?'}\``);
+              push('Trivy', mc.Severity, mc.ID, `${mc.Title || ''} in \`${r.Target || '?'}\``.trim());
             }
           }
 
           if (process.env.SAST_RAN === 'true') {
             for (const r of asArray(readJson('semgrep-results.json')?.results)) {
-              push('Semgrep', r.extra?.severity, `**Semgrep** \`${r.check_id || 'unknown'}\` in \`${r.path}:${r.start?.line ?? '?'}\``);
+              push('Semgrep', r.extra?.severity, r.check_id, `in \`${r.path}:${r.start?.line ?? '?'}\``);
             }
           }
 
-          findings.sort((a, b) => rank(a.severity) - rank(b.severity));
+          // --- Severity breakdown, overall and per-scanner (drives the header
+          // line and the per-scanner table columns) ---
+          const countBy = (list, pred) => list.filter(pred).length;
+          const severityTotals = Object.fromEntries(
+            Object.keys(SEVERITY_RANK).map((sev) => [sev, countBy(findings, (f) => f.severity === sev)]),
+          );
+          const headerLine = Object.keys(SEVERITY_RANK)
+            .filter((sev) => severityTotals[sev] > 0)
+            .map((sev) => `${SEVERITY_EMOJI[sev]} ${severityTotals[sev]} ${sev}`)
+            .join(' · ');
+
+          const bySeverityCols = (tool) =>
+            Object.keys(SEVERITY_RANK)
+              .map((sev) => countBy(findings, (f) => f.tool === tool && f.severity === sev))
+              .map((n) => (n > 0 ? String(n) : '-'));
+
+          const scannerRow = (label, tool, failed) =>
+            failed === 'true'
+              ? `| ${label} | | | | | | failed to run - see [logs](${runUrl}) |`
+              : `| ${label} | ${bySeverityCols(tool).join(' | ')} | ${countBy(findings, (f) => f.tool === tool)} |`;
+
+          const semgrepRow = process.env.SAST_RAN === 'true'
+            ? scannerRow('Semgrep (SAST)', 'Semgrep', process.env.SEMGREP_FAILED)
+            : '| Semgrep (SAST) | | | | | | skipped - no Python/Node/Rust/C# detected |';
+
+          // --- Group findings by (tool, rule, severity) so repeated hits of
+          // the same rule (e.g. one Semgrep check firing on 27 near-identical
+          // lines) collapse into a single row with a count, instead of
+          // burying the top-N list under duplicates of one rule. ---
+          const groups = new Map();
+          for (const f of findings) {
+            const key = `${f.tool}::${f.rule}::${f.severity}`;
+            if (!groups.has(key)) {
+              groups.set(key, { tool: f.tool, rule: f.rule, severity: f.severity, count: 0, example: f.text });
+            }
+            groups.get(key).count += 1;
+          }
+          const groupList = [...groups.values()].sort(
+            (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || b.count - a.count,
+          );
 
           const parsedMax = parseInt(process.env.MAX_FINDINGS, 10);
           const maxFindings = Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : 10;
-          const shown = findings.slice(0, maxFindings);
-          const hiddenCount = findings.length - shown.length;
+          const shownGroups = groupList.slice(0, maxFindings);
+          const hiddenGroups = groupList.length - shownGroups.length;
+          const hiddenFindings = findings.length - shownGroups.reduce((sum, g) => sum + g.count, 0);
 
-          const detailsBlock = shown.length
+          const detailsBlock = shownGroups.length
             ? [
                 '<details>',
-                `<summary>Top ${shown.length} finding(s)${hiddenCount > 0 ? ` — ${hiddenCount} more in the full report` : ''}</summary>`,
+                `<summary>Top ${shownGroups.length} rule(s) by occurrence${hiddenGroups > 0 ? ` — ${hiddenGroups} more distinct rule(s), ${hiddenFindings} more finding(s) in the full report` : ''}</summary>`,
                 '',
-                ...shown.map((f) => `- **${f.severity}** ${f.text}`),
+                '| | Rule | Occurrences | Example |',
+                '|---|---|---|---|',
+                ...shownGroups.map(
+                  (g) => `| ${SEVERITY_EMOJI[g.severity]} | **${g.tool}** \`${g.rule}\` | ${g.count} | ${g.example} |`,
+                ),
                 '',
                 '</details>',
               ].join('\n')
             : '';
 
-          // Row counts come from the findings actually listed above (not the separately
-          // computed bash counts) so the table can never disagree with the details list.
-          const countByTool = (tool) => findings.filter((f) => f.tool === tool).length;
-          const scannerRow = (label, count, failed) =>
-            failed === 'true'
-              ? `| ${label} | failed to run — see [logs](${runUrl}) |`
-              : `| ${label} | ${count} |`;
-
-          const semgrepRow = process.env.SAST_RAN === 'true'
-            ? scannerRow('Semgrep (SAST)', countByTool('Semgrep'), process.env.SEMGREP_FAILED)
-            : '| Semgrep (SAST) | skipped (no Python/Node/Rust/C# detected) |';
-
           const bodyLines = [
             marker,
             anyFailed
-              ? `### Security scan — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
-              : `### Security scan — ${findings.length} finding(s)`,
-            '',
-            '| Scanner | Findings |',
-            '|---|---|',
-            scannerRow(`Grype (dependency CVEs, severity >= ${process.env.SEVERITY_CUTOFF})`, countByTool('Grype'), process.env.GRYPE_FAILED),
-            scannerRow('Trivy (secrets + IaC misconfig)', countByTool('Trivy'), process.env.TRIVY_FAILED),
-            semgrepRow,
+              ? `## \u{1F6E1}\u{FE0F} Security scan — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
+              : `## \u{1F6E1}\u{FE0F} Security scan — ${findings.length} finding(s)`,
             '',
           ];
+          if (headerLine) {
+            bodyLines.push(headerLine, '');
+          }
+          bodyLines.push(
+            '| Scanner | \u{1F534} | \u{1F7E0} | \u{1F7E1} | \u{1F535} | ⚪ | Total |',
+            '|---|---|---|---|---|---|---|',
+            scannerRow(`Grype (dependency CVEs, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED),
+            scannerRow('Trivy (secrets + IaC misconfig)', 'Trivy', process.env.TRIVY_FAILED),
+            semgrepRow,
+            '',
+          );
           if (detailsBlock) {
             bodyLines.push(detailsBlock, '');
           }
