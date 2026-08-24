@@ -13,7 +13,9 @@ uses: hakimo-ai/actions/<action-name>@v1
 **This repo is public.** Anything committed here (code, comments, commit messages, PR discussions) is visible to anyone on the internet, indefinitely, even after a later revert. A few rules that follow from that:
 
 - **Never commit secrets, credentials, internal hostnames/IPs, AWS account IDs, or IAM role ARNs.** Every example in this repo uses `${{ secrets.* }}`/`${{ vars.* }}` placeholders for a reason — copy that pattern, don't hardcode real values, even "just for testing."
+- **Never name internal consumer repos, their workflow filenames, or internal directory paths.** Use the documented `company-*` placeholder pattern (e.g. `company-ai-engine`) in examples instead of a real internal repo name.
 - **`CLAUDE.md` (if present in your checkout) is gitignored on purpose.** It carries internal architecture/planning context that isn't meant to be public. Don't remove it from `.gitignore`.
+- **Enforced automatically:** `check-public-hygiene` runs as a pre-commit hook and in CI (`.github/workflows/public-hygiene.yml`) on every PR, and blocks real ARNs/account IDs, the real deploy role name, and known internal repo/workflow/path names.
 - **Treat every PR here as reviewable by anyone, forever.** Don't paste internal Slack threads, ticket numbers with sensitive context, or infrastructure details into commit messages or PR descriptions beyond what's needed to explain the change.
 - **Review dependency-bump PRs like any other code change, not a rubber stamp.** The whole point of [SHA-pinning](#why-commit-sha-pinning) is that a version bump is visible in a diff — actually look at it. Skipping that review defeats the protection.
 
@@ -53,6 +55,8 @@ A commit SHA is immutable — it is the content. Once we write `uses: aws-action
 **The tradeoff:**
 SHAs are not human-readable on their own, so every pin in this repo includes a comment with the version it corresponds to (e.g. `# v4.3.1`). When updating, you replace both the SHA and the comment together.
 
+**Verified automatically:** a manual copy-paste error while updating a pin (wrong SHA, stale comment) is caught by an automated CI check that runs on every PR touching an `action.yml`, plus a weekly scheduled run. It confirms each pinned SHA exists upstream and, where the comment names a specific `vX.Y.Z` release, that the SHA actually matches that tag.
+
 ---
 
 ## Pinned dependency versions
@@ -63,11 +67,11 @@ All versions target broadly compatible, non-freshly-cut majors to avoid breaking
 |----------------|---------|----------------|
 | `actions/checkout` *(setup-aws)* | v4.2.2 | `11bd71901bbe5b1630ceea73d27597364c9af683` |
 | `aws-actions/configure-aws-credentials` | v6.2.3 | `e6de054238d6b7531b4efff3b6587d9aade6a06c` |
-| `aws-actions/amazon-ecr-login` | v2.1.6 | `b040164c4934333d597f3f9c67502ff28f814e9c` |
+| `aws-actions/amazon-ecr-login` | v2.1.6 | `d539f0932e70871a027e9d5a9d8fc38589180a64` |
 | `docker/metadata-action` | v6.2.0 | `dc802804100637a589fabce1cb79ff13a1411302` |
-| `useblacksmith/setup-docker-builder` | v1.12.0 | `af73aad1881ac50c474addd444fe279cac9be318` |
+| `useblacksmith/setup-docker-builder` | v1.12.0 | `9309da73a81f66976a6d750572e221508b1e2682` |
 | `useblacksmith/build-push-action` | v2.3.0 | `9b0579bbec7a6cad2f171596c57e7ac1e7658850` |
-| `aquasecurity/trivy-action` | v0.36.0 | `a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8` |
+| `aquasecurity/trivy-action` | v0.36.0 | `ed142fd0673e97e23eac54620cfb913e5ce36c25` |
 | `anchore/scan-action` | v6.5.1 | `1638637db639e0ade3258b51db49a9a137574c3e` |
 | `actions/upload-artifact` | v4.6.2 | `ea165f8d65b6e75b540449e92b4886f43607fa02` |
 | `actions/github-script` | v7.1.0 | `f28e40c7f34bde8b3046d885e986cb6290c5673b` |

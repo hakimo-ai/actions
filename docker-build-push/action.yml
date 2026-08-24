@@ -56,7 +56,7 @@ runs:
           type=raw,enable=${{ inputs.tag == '' && inputs.latest-on-master == 'true' && github.ref_name == 'master' }},value=latest
 
     - name: Set up Docker Buildx
-      uses: useblacksmith/setup-docker-builder@af73aad1881ac50c474addd444fe279cac9be318  # v1.12.0
+      uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682  # v1.12.0
 
     - name: Build & Push
       uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850  # v2.3.0

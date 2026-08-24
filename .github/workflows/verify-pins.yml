@@ -1,0 +1,37 @@
+# Verifies every SHA-pinned third-party action referenced across this repo's
+# action.yml files actually resolves to a real, existing commit upstream, and
+# still matches the version tag named in its trailing comment. Exists because
+# a manual copy-paste error during a version bump can silently leave a pin
+# pointing at a commit that doesn't exist (or the wrong one) - the pin looks
+# fine in review but hard-fails the first time that step actually runs.
+# See .github/scripts/verify-pins.sh for the check logic.
+name: Verify action pins
+
+on:
+  pull_request:
+    paths:
+      - '**/action.yml'
+      - '.github/scripts/verify-pins.sh'
+      - '.github/workflows/verify-pins.yml'
+  push:
+    branches:
+      - master
+  schedule:
+    # Weekly safety net - catches drift even on a week with no action.yml
+    # changes (e.g. someone edits a pin without triggering the path filter,
+    # or wants an independent periodic confirmation the pins are still good).
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Verify SHA pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/verify-pins.sh

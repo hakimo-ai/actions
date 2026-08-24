@@ -1,5 +1,5 @@
 name: Lint Check
-description: Language-aware lint/format check. Detects Python/Node/Rust in the target repo and runs the matching linter; C#/Go/C++ are detected but intentionally out of scope (see README).
+description: Language-aware lint/format check. Detects Python/Node/Rust in the target repo and runs the matching linter; C#/Go/C++ are detected but intentionally out of scope (see README). Optionally runs cargo test for Rust via run-tests.
 
 inputs:
   path:
@@ -15,9 +15,13 @@ inputs:
     required: false
     default: '20'
   rust-toolchain:
-    description: Rust toolchain channel for cargo fmt/clippy (e.g. stable, 1.75.0)
+    description: Rust toolchain channel for cargo fmt/clippy/test (e.g. stable, 1.75.0)
     required: false
     default: stable
+  run-tests:
+    description: Also run `cargo test --all-features` when Rust is detected. Off by default so existing callers are unaffected. Test failures count as findings, gated by fail-on-findings like every other linter here.
+    required: false
+    default: 'false'
   fail-on-findings:
     description: Fail the job if any linter reports findings (a linter crash always fails the job regardless of this setting)
     required: false
@@ -408,6 +412,61 @@ runs:
           echo "cargo fmt/clippy findings: $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
+    - name: Run cargo test
+      id: rust-test
+      if: steps.detect.outputs.rust == 'true' && inputs.run-tests == 'true' && steps.rust.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        set +e
+        cargo test --all-features > cargo-test-results.txt 2>&1
+        test_code=$?
+        set -e
+
+        # cargo test: 0 = all passed. 101 is cargo's generic "build failed"
+        # code, covering both "some tests failed" (real findings) and a hard
+        # compile failure (a genuine crash). Unlike clippy, cargo test runs
+        # unit/integration tests and doctests as separate phases - an earlier
+        # phase can pass and print its 'test result:' summary line before a
+        # later phase (doctests are especially prone to this - they compile
+        # independently of the rest of the crate) fails to compile. So a
+        # 'test result:' line being present doesn't rule out a crash; only
+        # the absence of any rustc/cargo compile-error marker does.
+        test_crash="false"
+        if [ "$test_code" -ne 0 ] && [ "$test_code" -ne 101 ]; then
+          test_crash="true"
+        elif [ "$test_code" -eq 101 ]; then
+          if grep -qE 'error(\[E[0-9]+\])?: could not compile|error: aborting due to' cargo-test-results.txt; then
+            test_crash="true"
+          elif ! grep -q '^test result:' cargo-test-results.txt; then
+            test_crash="true"
+          fi
+        fi
+
+        if [ "$test_crash" = "true" ]; then
+          echo "::error::cargo test exited abnormally ($test_code) - see logs"
+          cat cargo-test-results.txt >&2
+          exit 1
+        fi
+
+    - name: Summarize cargo test findings
+      id: rust-test-summary
+      if: always() && steps.detect.outputs.rust == 'true' && inputs.run-tests == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.rust-test.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "cargo test: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(grep -cE '^test .* \.\.\. FAILED$' cargo-test-results.txt 2>/dev/null || echo 0)
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "cargo test findings (failed tests): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: Run yamllint
       id: yamllint
       if: steps.detect.outputs.yaml == 'true'
@@ -462,11 +521,14 @@ runs:
         PRETTIER_FAILED: ${{ steps.prettier-summary.outputs.failed }}
         RUST_COUNT: ${{ steps.rust-summary.outputs.count }}
         RUST_FAILED: ${{ steps.rust-summary.outputs.failed }}
+        RUST_TEST_RAN: ${{ inputs.run-tests }}
+        RUST_TEST_COUNT: ${{ steps.rust-test-summary.outputs.count }}
+        RUST_TEST_FAILED: ${{ steps.rust-test-summary.outputs.failed }}
         YAML_COUNT: ${{ steps.yamllint-summary.outputs.count }}
         YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
-        total=$(( ${RUFF_COUNT:-0} + ${MYPY_COUNT:-0} + ${PYLINT_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${YAML_COUNT:-0} ))
+        total=$(( ${RUFF_COUNT:-0} + ${MYPY_COUNT:-0} + ${PYLINT_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${RUST_TEST_COUNT:-0} + ${YAML_COUNT:-0} ))
 
         failed_scanners=""
         any_failed="false"
@@ -476,6 +538,7 @@ runs:
                     "ESLint:${ESLINT_FAILED:-false}" \
                     "Prettier:${PRETTIER_FAILED:-false}" \
                     "cargo fmt/clippy:${RUST_FAILED:-false}" \
+                    "cargo test:${RUST_TEST_FAILED:-false}" \
                     "yamllint:${YAML_FAILED:-false}"; do
           name="${pair%%:*}"
           val="${pair#*:}"
@@ -516,6 +579,7 @@ runs:
           ${{ inputs.path }}/cargo-fmt-results.txt
           ${{ inputs.path }}/cargo-clippy-results.json
           ${{ inputs.path }}/cargo-clippy-stderr.txt
+          ${{ inputs.path }}/cargo-test-results.txt
           ${{ inputs.path }}/yamllint-results.txt
         if-no-files-found: ignore
         retention-days: 30
@@ -532,6 +596,8 @@ runs:
         ESLINT_FAILED: ${{ steps.eslint-summary.outputs.failed }}
         PRETTIER_FAILED: ${{ steps.prettier-summary.outputs.failed }}
         RUST_FAILED: ${{ steps.rust-summary.outputs.failed }}
+        RUST_TEST_RAN: ${{ inputs.run-tests }}
+        RUST_TEST_FAILED: ${{ steps.rust-test-summary.outputs.failed }}
         YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
         ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
         FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
@@ -626,6 +692,15 @@ runs:
             }
           }
 
+          if (process.env.RUST_RAN === 'true' && process.env.RUST_TEST_RAN === 'true') {
+            for (const line of readLines('cargo-test-results.txt')) {
+              const m = line.match(/^test (.+) \.\.\. FAILED$/);
+              if (m) {
+                push('cargo test', 'error', `**cargo test** \`${m[1]}\` failed`);
+              }
+            }
+          }
+
           if (process.env.YAML_RAN === 'true') {
             for (const line of readLines('yamllint-results.txt')) {
               const m = line.match(/^(.+):(\d+):(\d+): \[(warning|error)\] (.+)$/);
@@ -690,6 +765,11 @@ runs:
           rows.push(
             process.env.RUST_RAN === 'true'
               ? scannerRow('cargo fmt/clippy', countByTool('cargo clippy') + countByTool('cargo fmt'), process.env.RUST_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.RUST_RAN === 'true' && process.env.RUST_TEST_RAN === 'true'
+              ? scannerRow('cargo test', countByTool('cargo test'), process.env.RUST_TEST_FAILED)
               : null,
           );
           rows.push(

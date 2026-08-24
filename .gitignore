@@ -22,3 +22,6 @@ CLAUDE.md
 
 # Node (in case any action adds a JS/TS implementation)
 node_modules/
+
+
+COMMIT_MESSAGE.txt
