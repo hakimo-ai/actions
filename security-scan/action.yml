@@ -22,6 +22,10 @@ inputs:
     description: Fail the job if Trivy finds any secrets, independent of fail-on-findings. Lets the secrets lane be made blocking on its own (e.g. once a repo scans clean) while Grype/Trivy-misconfig/Semgrep stay monitoring-only.
     required: false
     default: 'false'
+  semgrep-diff-aware:
+    description: On pull_request events, scan only the diff since the PR's base commit (via Semgrep's --baseline-commit) instead of the whole repo, so pre-existing findings unrelated to the PR don't show up every time. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan.
+    required: false
+    default: 'true'
   comment-on-pr:
     description: "Post/update a PR comment with the findings summary (requires 'pull-requests: write' in the caller). No-op outside pull_request/pull_request_target events."
     required: false
@@ -184,10 +188,28 @@ runs:
       if: steps.detect.outputs.sast == 'true'
       continue-on-error: true
       shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        DIFF_AWARE: ${{ inputs.semgrep-diff-aware }}
       run: |
+        # git history check runs on the host, not inside the semgrep image -
+        # the image is minimal and isn't guaranteed to have git installed,
+        # and the mounted volume's .git dir is equally visible from either
+        # side anyway.
+        baseline_args=""
+        if [ "$EVENT_NAME" = "pull_request" ] && [ "$DIFF_AWARE" = "true" ] && [ -n "$BASE_SHA" ]; then
+          if git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            baseline_args="--baseline-commit $BASE_SHA"
+            echo "Semgrep: diff-aware scan against base commit $BASE_SHA"
+          else
+            echo "::warning::semgrep-diff-aware is enabled but base commit $BASE_SHA isn't available locally (checkout needs more git history, e.g. fetch-depth: 0) - falling back to a full scan"
+          fi
+        fi
+
         docker run --rm -v "$PWD:/github/workspace" -w /github/workspace \
           semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a \
-          semgrep scan --config ${{ inputs.semgrep-config }} --json --output semgrep-results.json ${{ inputs.path }}
+          semgrep scan --config ${{ inputs.semgrep-config }} $baseline_args --json --output semgrep-results.json ${{ inputs.path }}
 
     - name: Summarize Semgrep findings
       id: semgrep-summary
