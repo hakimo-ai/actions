@@ -18,6 +18,10 @@ inputs:
     description: Fail the job if any scanner reports findings
     required: false
     default: 'false'
+  fail-on-secrets:
+    description: Fail the job if Trivy finds any secrets, independent of fail-on-findings. Lets the secrets lane be made blocking on its own (e.g. once a repo scans clean) while Grype/Trivy-misconfig/Semgrep stay monitoring-only.
+    required: false
+    default: 'false'
   comment-on-pr:
     description: "Post/update a PR comment with the findings summary (requires 'pull-requests: write' in the caller). No-op outside pull_request/pull_request_target events."
     required: false
@@ -138,12 +142,19 @@ runs:
         if [ "$TRIVY_OUTCOME" = "failure" ]; then
           echo "failed=true" >> "$GITHUB_OUTPUT"
           echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "secrets-count=0" >> "$GITHUB_OUTPUT"
           echo "Trivy: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
-          count=$(jq '[.Results[]? | ((.Secrets // []) + (.Misconfigurations // []))[]] | length' trivy-results.json 2>/dev/null || echo 0)
+          # Counted separately (not just combined) so fail-on-secrets can gate
+          # on just the secrets lane independent of fail-on-findings, which
+          # still gates on the combined secrets+misconfig total below.
+          secrets_count=$(jq '[.Results[]? | (.Secrets // [])[]] | length' trivy-results.json 2>/dev/null || echo 0)
+          misconfig_count=$(jq '[.Results[]? | (.Misconfigurations // [])[]] | length' trivy-results.json 2>/dev/null || echo 0)
+          count=$((secrets_count + misconfig_count))
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Trivy findings (secrets + misconfig): $count" >> "$GITHUB_STEP_SUMMARY"
+          echo "secrets-count=$secrets_count" >> "$GITHUB_OUTPUT"
+          echo "Trivy findings (secrets + misconfig): $count ($secrets_count secret(s))" >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Restore Semgrep image cache
@@ -204,11 +215,13 @@ runs:
         GRYPE_COUNT: ${{ steps.grype-summary.outputs.count }}
         GRYPE_FAILED: ${{ steps.grype-summary.outputs.failed }}
         TRIVY_COUNT: ${{ steps.trivy-summary.outputs.count }}
+        TRIVY_SECRETS_COUNT: ${{ steps.trivy-summary.outputs.secrets-count }}
         TRIVY_FAILED: ${{ steps.trivy-summary.outputs.failed }}
         SEMGREP_COUNT: ${{ steps.semgrep-summary.outputs.count }}
         SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
         SAST_RAN: ${{ steps.detect.outputs.sast }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
       run: |
         total=$(( ${GRYPE_COUNT:-0} + ${TRIVY_COUNT:-0} + ${SEMGREP_COUNT:-0} ))
         echo "total-findings=$total" >> "$GITHUB_OUTPUT"
@@ -234,7 +247,13 @@ runs:
           echo "No findings."
         fi
 
-        if [ -n "$failed" ] || { [ "$total" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = "true" ]; }; then
+        secrets_blocking="false"
+        if [ "$FAIL_ON_SECRETS" = "true" ] && [ "${TRIVY_SECRETS_COUNT:-0}" -gt 0 ]; then
+          secrets_blocking="true"
+          echo "::error::fail-on-secrets is set and Trivy found ${TRIVY_SECRETS_COUNT} secret(s)."
+        fi
+
+        if [ -n "$failed" ] || { [ "$total" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = "true" ]; } || [ "$secrets_blocking" = "true" ]; then
           exit 1
         fi
 

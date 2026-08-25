@@ -617,11 +617,17 @@ runs:
         script: |
           const path = require('path');
           const fs = require('fs');
-          const marker = '<!-- hakimo-ai/actions/lint-check -->';
+          const scanPath = process.env.SCAN_PATH || '.';
+          // Includes scanPath so multiple lint-check calls in the same PR
+          // (e.g. a matrix over several crates/packages) each get their own
+          // comment instead of racing to overwrite one shared marker - only
+          // the last one to finish used to survive. A caller that only ever
+          // scans one path (the common case) is unaffected: the marker is
+          // just as stable as before, only now it also encodes which path.
+          const marker = `<!-- hakimo-ai/actions/lint-check:${scanPath} -->`;
           const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
           const anyFailed = process.env.ANY_FAILED === 'true';
-          const scanPath = process.env.SCAN_PATH || '.';
           const scanDir = path.isAbsolute(scanPath) ? scanPath : path.join(process.env.WORKDIR, scanPath);
 
           const readJson = (file) => {
@@ -786,11 +792,16 @@ runs:
             outOfScope.push('Node (no ESLint/Prettier config found)');
           }
 
+          // Only show the path in the visible header when it's not the
+          // default '.' - the common single-instance caller shouldn't gain
+          // a redundant "(.)" in its heading just because the marker now
+          // encodes the path internally.
+          const pathLabel = scanPath !== '.' ? ` (\`${scanPath}\`)` : '';
           const bodyLines = [
             marker,
             anyFailed
-              ? `### Lint check — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
-              : `### Lint check — ${findings.length} finding(s)`,
+              ? `### Lint check${pathLabel} — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
+              : `### Lint check${pathLabel} — ${findings.length} finding(s)`,
             '',
             '| Linter | Findings |',
             '|---|---|',

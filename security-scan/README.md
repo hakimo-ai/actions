@@ -18,7 +18,7 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 | 6. Summarize Trivy findings | Same crash-vs-clean distinction as step 4. |
 | 7-9. Semgrep SAST | Only runs if `sast` is true (Python/Node/Rust/C# detected). The Semgrep Docker image is cached (`actions/cache`, keyed on the pinned version) and loaded via `docker load` instead of pulled fresh every run — a cold image pull was the single largest per-run cost outside the scans themselves. Runs `semgrep scan --config <semgrep-config> --json`. |
 | 10. Summarize Semgrep findings | Same crash-vs-clean distinction, skipped entirely (not just "0 findings") when `sast` was false. |
-| 11. Evaluate findings (gate) | Sums all three counts. **Fails the job unconditionally if any scanner crashed**, regardless of `fail-on-findings` — a crash is never allowed to look like a clean scan. Only fails on findings (not crashes) when `fail-on-findings: true`. |
+| 11. Evaluate findings (gate) | Sums all three counts. **Fails the job unconditionally if any scanner crashed**, regardless of `fail-on-findings` — a crash is never allowed to look like a clean scan. Only fails on findings (not crashes) when `fail-on-findings: true`. Independently, `fail-on-secrets: true` fails the job if Trivy's secrets count (tracked separately from its misconfig count) is nonzero — lets a repo make just the secrets lane blocking once it scans clean, without needing `fail-on-findings` to cover Grype/misconfig/Semgrep too. |
 | 12. Upload scan reports | The three JSON reports (`grype-results.json`, `trivy-results.json`, `semgrep-results.json`) as a `security-scan-reports` artifact — skipped when there's nothing to show, so a clean run doesn't burn artifact storage. |
 | 13. Post PR comment | On `pull_request`/`pull_request_target` only (no-op otherwise). Reads the same three JSON files back off disk, builds a compact per-scanner count table plus the top `max-comment-findings` findings (most severe first) in a collapsed `<details>` block, and upserts a single comment (matched via an HTML marker, paginating through all existing comments so it never misses its own prior comment on an active PR). |
 
@@ -30,6 +30,7 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 | `severity-cutoff` | no | `high` | Minimum severity to treat as a finding (`negligible`, `low`, `medium`, `high`, `critical`) — drives both Grype's cutoff and Trivy's severity list |
 | `semgrep-config` | no | `auto` | Semgrep ruleset config (e.g. `auto`, `p/python`, `p/ci`) |
 | `fail-on-findings` | no | `false` | Fail the job if any scanner reports findings (a scanner crash always fails the job regardless of this setting) |
+| `fail-on-secrets` | no | `false` | Fail the job if Trivy finds any secrets, independent of `fail-on-findings`. For making just the secrets lane blocking (e.g. once a repo scans clean) while everything else stays monitoring-only |
 | `comment-on-pr` | no | `true` | Post/update a PR comment with the findings summary. No-op outside `pull_request`/`pull_request_target` events |
 | `max-comment-findings` | no | `10` | Max number of individual findings (most severe first) to list in the PR comment's collapsed detail section |
 
