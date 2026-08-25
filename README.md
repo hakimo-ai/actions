@@ -160,7 +160,7 @@ steps:
   - uses: hakimo-ai/actions/security-scan@v1
     with:
       path: .
-      severity-cutoff: 'medium'
+      severity-cutoff: 'high'
 ```
 
 ---

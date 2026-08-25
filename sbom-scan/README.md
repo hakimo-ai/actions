@@ -16,7 +16,8 @@ Extracted from a working production release workflow — not a new design, a reu
 | 2. Compute SBOM file name | Validates `format` (only `spdx-json`/`cyclonedx-json` are supported — anything else fails loudly here instead of silently mislabeling the output file's extension later). Derives a filesystem/artifact-safe base name from either `sbom-name` (if given) or a sanitized version of `image`, then emits the real absolute path once — every later step and the action's own `sbom-path` output use that same value directly, nothing re-derives it. |
 | 3. Generate SBOM | `anchore/sbom-action` produces the SBOM file, uploads it as a workflow artifact, and (if `upload-release-assets: 'true'`) attaches it to the current GitHub Release. |
 | 4. Scan SBOM | `anchore/scan-action` (the same tool `security-scan` uses for Grype, in the mode that scans an existing SBOM document instead of a live path) — `output-format: json` so findings are machine-parseable, `fail-build: 'false'` so a dirty scan doesn't itself crash the step. |
-| 5. Evaluate findings (gate) | Checks all four prior steps' outcomes individually (`setup-aws`/`name`/`sbom`/`scan`) and fails the job with a specific, accurate error naming which one broke if any of them didn't succeed — **regardless of `fail-on-findings`**. Only fails on findings (not crashes) when `fail-on-findings: true` and the scan actually found something at or above `severity-cutoff`. |
+| 5. Evaluate findings (gate) | Checks all four prior steps' outcomes individually (`setup-aws`/`name`/`sbom`/`scan`) and fails the job with a specific, accurate error naming which one broke if any of them didn't succeed — **regardless of `fail-on-findings`**. Only fails on findings (not crashes) when `fail-on-findings: true` and the scan actually found something at or above `severity-cutoff`. Also writes a severity breakdown and a table of the most severe findings (CVE, package, fix version — up to `max-summary-findings`) directly to the workflow run's summary page, so findings are visible without opening the raw JSON. |
+| 6. Upload scan results | The raw Grype JSON (`sbom-scan-results.json`) is uploaded as a `sbom-scan-results` artifact whenever the scan actually ran, regardless of findings count — the full report behind the summary table above. |
 
 This is a single-image action — for a matrix of images, the caller keeps its own `strategy: matrix` at the job level and calls `sbom-scan` once per matrix entry, the same way a caller would call `docker-build-push` once per Dockerfile.
 
@@ -29,9 +30,10 @@ This is a single-image action — for a matrix of images, the caller keeps its o
 | `image` | yes | — | Full image reference to generate an SBOM for |
 | `sbom-name` | no | `''` | Base name for the SBOM file/artifact. Defaults to a sanitized version of `image` |
 | `format` | no | `spdx-json` | SBOM format — `spdx-json` or `cyclonedx-json` only |
-| `severity-cutoff` | no | `medium` | Minimum severity to treat as a finding |
+| `severity-cutoff` | no | `high` | Minimum severity to treat as a finding |
 | `fail-on-findings` | no | `false` | Fail the job if the scan reports findings (a crash always fails the job regardless) |
 | `upload-release-assets` | no | `false` | Attach the SBOM to the current GitHub Release. Only meaningful on a `release` event — requires `contents: write` on the caller's job |
+| `max-summary-findings` | no | `10` | Max number of individual findings (most severe first) to list in the workflow run summary |
 
 ## Outputs
 

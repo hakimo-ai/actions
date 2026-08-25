@@ -22,7 +22,7 @@ inputs:
   severity-cutoff:
     description: Minimum severity to treat as a finding (negligible, low, medium, high, critical)
     required: false
-    default: medium
+    default: high
   fail-on-findings:
     description: Fail the job if the SBOM scan reports findings (a scan crash always fails the job regardless of this setting)
     required: false
@@ -31,6 +31,10 @@ inputs:
     description: "Attach the SBOM to the current GitHub Release. Only meaningful on a release event - requires the caller's job to have 'contents: write' permission"
     required: false
     default: 'false'
+  max-summary-findings:
+    description: Max number of individual findings (most severe first) to list in the workflow run summary
+    required: false
+    default: '10'
 
 outputs:
   sbom-path:
@@ -124,6 +128,8 @@ runs:
         SBOM_OUTCOME: ${{ steps.sbom.outcome }}
         SCAN_OUTCOME: ${{ steps.scan.outcome }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
+        MAX_SUMMARY_FINDINGS: ${{ inputs.max-summary-findings }}
       run: |
         if [ "$SETUP_ECR_OUTCOME" != "success" ]; then
           echo "::error::AWS/ECR setup failed - see the 'Setup ECR' step above"
@@ -151,9 +157,49 @@ runs:
 
         count=$(jq '.matches | length' sbom-scan-results.json 2>/dev/null || echo 0)
         echo "total-findings=$count" >> "$GITHUB_OUTPUT"
-        echo "SBOM scan found $count finding(s) at or above severity-cutoff" >> "$GITHUB_STEP_SUMMARY"
+
+        # Validate max-summary-findings as a non-negative integer; anything
+        # else (unset, blank, non-numeric) falls back to the default rather
+        # than being silently treated as 0 findings shown.
+        case "$MAX_SUMMARY_FINDINGS" in
+          ''|*[!0-9]*) MAX_SUMMARY_FINDINGS=10 ;;
+        esac
+
+        {
+          echo "### SBOM scan — $count finding(s) at or above severity-cutoff ($SEVERITY_CUTOFF)"
+          if [ "$count" -gt 0 ]; then
+            echo ""
+            jq -r '
+              def rank: {"critical":0,"high":1,"medium":2,"low":3,"negligible":4,"unknown":5}[(.vulnerability.severity // "Unknown") | ascii_downcase] // 5;
+              [.matches[]] | group_by(.vulnerability.severity // "Unknown") | sort_by({"critical":0,"high":1,"medium":2,"low":3,"negligible":4,"unknown":5}[(.[0].vulnerability.severity // "Unknown") | ascii_downcase] // 5) |
+              map("\(length) \(.[0].vulnerability.severity // "Unknown")") | join(" · ")
+            ' sbom-scan-results.json
+            echo ""
+            echo "| Severity | CVE | Package | Fix |"
+            echo "|---|---|---|---|"
+            jq -r --argjson max "$MAX_SUMMARY_FINDINGS" '
+              def rank: {"critical":0,"high":1,"medium":2,"low":3,"negligible":4,"unknown":5}[(.vulnerability.severity // "Unknown") | ascii_downcase] // 5;
+              [.matches[]] | sort_by(rank) | .[0:$max] | .[] |
+              "| " + (.vulnerability.severity // "Unknown") + " | " + (.vulnerability.id // "?") + " | " + (.artifact.name // "?") + "@" + (.artifact.version // "?") + " | " + (if (.vulnerability.fix.versions // []) == [] then "-" else ((.vulnerability.fix.versions // []) | join(", ")) end) + " |"
+            ' sbom-scan-results.json
+            hidden=$(( count > MAX_SUMMARY_FINDINGS ? count - MAX_SUMMARY_FINDINGS : 0 ))
+            if [ "$hidden" -gt 0 ]; then
+              echo ""
+              echo "_...and $hidden more. Full report: \`sbom-scan-results\` artifact._"
+            fi
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
 
         if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$count" -gt 0 ]; then
           echo "::error::SBOM scan found $count finding(s) at or above severity-cutoff"
           exit 1
         fi
+
+    - name: Upload scan results
+      if: always() && steps.scan.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      with:
+        name: sbom-scan-results
+        path: sbom-scan-results.json
+        if-no-files-found: ignore
+        retention-days: 30

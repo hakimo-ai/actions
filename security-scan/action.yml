@@ -9,7 +9,7 @@ inputs:
   severity-cutoff:
     description: Minimum vulnerability severity to treat as a finding (negligible, low, medium, high, critical)
     required: false
-    default: 'medium'
+    default: 'high'
   semgrep-config:
     description: Semgrep ruleset config (e.g. auto, p/python, p/ci)
     required: false

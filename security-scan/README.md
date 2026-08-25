@@ -27,7 +27,7 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `path` | no | `.` | Root path to scan |
-| `severity-cutoff` | no | `medium` | Minimum severity to treat as a finding (`negligible`, `low`, `medium`, `high`, `critical`) — drives both Grype's cutoff and Trivy's severity list |
+| `severity-cutoff` | no | `high` | Minimum severity to treat as a finding (`negligible`, `low`, `medium`, `high`, `critical`) — drives both Grype's cutoff and Trivy's severity list |
 | `semgrep-config` | no | `auto` | Semgrep ruleset config (e.g. `auto`, `p/python`, `p/ci`) |
 | `fail-on-findings` | no | `false` | Fail the job if any scanner reports findings (a scanner crash always fails the job regardless of this setting) |
 | `comment-on-pr` | no | `true` | Post/update a PR comment with the findings summary. No-op outside `pull_request`/`pull_request_target` events |
@@ -54,7 +54,7 @@ steps:
   - uses: hakimo-ai/actions/security-scan@v1
     with:
       path: .
-      severity-cutoff: 'medium'
+      severity-cutoff: 'high'
       fail-on-findings: 'false'
 ```
 
