@@ -3,9 +3,21 @@ description: Language-aware security scan — auto-detects Python/Node/Rust/C#/I
 
 inputs:
   path:
-    description: Root path to scan
+    description: Root path to scan. Used by Trivy and Semgrep always; used by Grype only when image is not set.
     required: false
     default: '.'
+  image:
+    description: Full image reference (e.g. <registry>/<repo>:<tag>) for Grype to scan instead of path. Directory-mode Grype scans only catalog manifests Syft directly recognizes - a plain requirements.txt with unresolved/range versions is often invisible to it. Scanning the actual built image (installed site-packages, base OS layer) finds the real dependency CVEs instead. Trivy/Semgrep are unaffected - IaC misconfig, secrets, and SAST are about source, not the built image. Requires role-to-assume and aws-region if the image is in a private registry.
+    required: false
+    default: ''
+  role-to-assume:
+    description: IAM role ARN to assume via OIDC, for pulling image from a private registry. Only used when image is set.
+    required: false
+    default: ''
+  aws-region:
+    description: AWS region for the ECR login. Only used when image is set.
+    required: false
+    default: ''
   severity-cutoff:
     description: Minimum vulnerability severity to treat as a finding (negligible, low, medium, high, critical)
     required: false
@@ -94,12 +106,50 @@ runs:
         esac
         echo "trivy-severity=$list" >> "$GITHUB_OUTPUT"
 
+        # Semgrep only has 3 native levels (ERROR/WARNING/INFO), unlike our
+        # 5-level scale - "critical" and "high" both collapse to ERROR-only,
+        # "low" and "negligible" both collapse to everything, same pattern
+        # as Trivy's own low/negligible collapse above. Semgrep's --severity
+        # flag can be repeated but doesn't take a comma list, so the case
+        # emits the fully-formed repeated-flag string directly (no
+        # intermediate list + loop to re-split it downstream).
+        case "$CUTOFF" in
+          critical|high) semgrep_args="--severity ERROR" ;;
+          medium) semgrep_args="--severity ERROR --severity WARNING" ;;
+          low|negligible) semgrep_args="--severity ERROR --severity WARNING --severity INFO" ;;
+          *) semgrep_args="--severity ERROR --severity WARNING" ;;
+        esac
+        echo "semgrep-severity-args=$semgrep_args" >> "$GITHUB_OUTPUT"
+
+    # Duplicated from setup-aws/action.yml rather than calling it directly -
+    # setup-aws bundles its own checkout and requires role-to-assume/aws-region,
+    # neither of which fits here (checkout already happened, both inputs are
+    # optional since image-mode itself is optional). Keep the pinned SHAs
+    # below in sync with setup-aws/action.yml when either gets bumped.
+    - name: Configure AWS credentials for image-mode Grype
+      id: aws-configure
+      if: inputs.image != '' && inputs.role-to-assume != ''
+      continue-on-error: true
+      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Login to Amazon ECR for image-mode Grype
+      id: ecr-login
+      if: inputs.image != '' && inputs.role-to-assume != ''
+      continue-on-error: true
+      uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2.1.6
+
     - name: Run Grype (dependency CVEs)
       id: grype
       continue-on-error: true
       uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e  # v6.5.1
       with:
-        path: ${{ inputs.path }}
+        # path and image are mutually exclusive in anchore/scan-action -
+        # only ever send one as non-empty.
+        path: ${{ inputs.image == '' && inputs.path || '' }}
+        image: ${{ inputs.image }}
         output-format: json
         output-file: grype-results.json
         severity-cutoff: ${{ inputs.severity-cutoff }}
@@ -111,6 +161,9 @@ runs:
       shell: bash
       env:
         GRYPE_OUTCOME: ${{ steps.grype.outcome }}
+        GRYPE_IMAGE: ${{ inputs.image }}
+        GRYPE_PATH: ${{ inputs.path }}
+        SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
       run: |
         if [ "$GRYPE_OUTCOME" = "failure" ]; then
           echo "failed=true" >> "$GITHUB_OUTPUT"
@@ -120,7 +173,12 @@ runs:
           count=$(jq '.matches | length' grype-results.json 2>/dev/null || echo 0)
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Grype findings (severity >= ${{ inputs.severity-cutoff }}): $count" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$GRYPE_IMAGE" ]; then
+            scan_target="image $GRYPE_IMAGE"
+          else
+            scan_target="path $GRYPE_PATH"
+          fi
+          echo "Grype findings ($scan_target, severity >= $SEVERITY_CUTOFF): $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Run Trivy (secrets + IaC misconfig)
@@ -192,6 +250,7 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         DIFF_AWARE: ${{ inputs.semgrep-diff-aware }}
+        SEMGREP_SEVERITY_ARGS: ${{ steps.severity.outputs.semgrep-severity-args }}
       run: |
         # git history check runs on the host, not inside the semgrep image -
         # the image is minimal and isn't guaranteed to have git installed,
@@ -207,9 +266,13 @@ runs:
           fi
         fi
 
+        # severity-cutoff previously only reached Grype/Trivy - Semgrep ran
+        # fully unfiltered regardless of the input. SEMGREP_SEVERITY_ARGS is
+        # the fully-formed, action-controlled --severity flag string from
+        # the "Map severity threshold" step above.
         docker run --rm -v "$PWD:/github/workspace" -w /github/workspace \
           semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a \
-          semgrep scan --config ${{ inputs.semgrep-config }} $baseline_args --json --output semgrep-results.json ${{ inputs.path }}
+          semgrep scan --config ${{ inputs.semgrep-config }} $baseline_args $SEMGREP_SEVERITY_ARGS --json --output semgrep-results.json ${{ inputs.path }}
 
     - name: Summarize Semgrep findings
       id: semgrep-summary
@@ -302,6 +365,7 @@ runs:
         FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
         SAST_RAN: ${{ steps.detect.outputs.sast }}
         SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
+        GRYPE_IMAGE: ${{ inputs.image }}
         MAX_FINDINGS: ${{ inputs.max-comment-findings }}
       with:
         script: |
@@ -431,10 +495,13 @@ runs:
           if (headerLine) {
             bodyLines.push(headerLine, '');
           }
+          const grypeTarget = process.env.GRYPE_IMAGE
+            ? `image \`${process.env.GRYPE_IMAGE}\``
+            : 'path scan';
           bodyLines.push(
             '| Scanner | \u{1F534} | \u{1F7E0} | \u{1F7E1} | \u{1F535} | ⚪ | Total |',
             '|---|---|---|---|---|---|---|',
-            scannerRow(`Grype (dependency CVEs, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED),
+            scannerRow(`Grype (dependency CVEs, ${grypeTarget}, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED),
             scannerRow('Trivy (secrets + IaC misconfig)', 'Trivy', process.env.TRIVY_FAILED),
             semgrepRow,
             '',

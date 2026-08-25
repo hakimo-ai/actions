@@ -11,12 +11,12 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 | Step | What happens |
 |---|---|
 | 1. Detect project languages | A `find`-based helper checks the target `path` for Python/Node/Rust/C# manifest files and IaC markers (`Dockerfile`, `*.tf`, `kustomization.y*ml`), and sets a boolean per language plus a combined `sast` flag (true if any of Python/Node/Rust/C# is present). |
-| 2. Map severity threshold | Converts the single `severity-cutoff` input into the uppercase, comma-separated list Trivy expects (Grype takes the same value directly). |
-| 3. Run Grype | `anchore/scan-action` in path-scan mode — dependency CVEs. Auto-detects Python, npm/yarn, Cargo, and NuGet manifests via Syft's catalogers. Matches the tool already used for image scanning in this org's release workflows, so there's one CVE-scanning tool org-wide instead of introducing a second. |
+| 2. Map severity threshold | Converts the single `severity-cutoff` input into the uppercase, comma-separated list Trivy expects (Grype takes the same value directly), and separately into a ready-to-use, repeated `--severity` flag string for Semgrep's own `ERROR`/`WARNING`/`INFO` levels — Semgrep previously ran fully unfiltered regardless of `severity-cutoff`. Semgrep only has 3 native levels against our 5-level scale, so `critical`/`high` both collapse to `ERROR`-only and `low`/`negligible` both collapse to everything, same collapsing pattern as Trivy's own mapping. |
+| 3. Run Grype | `anchore/scan-action` in path-scan mode by default — dependency CVEs. Auto-detects Python, npm/yarn, Cargo, and NuGet manifests via Syft's catalogers, but a plain `requirements.txt` with unresolved/range versions is often invisible to it. When `image` is set, scans that container image instead (installed site-packages, base OS layer included) - configures AWS credentials and logs into ECR first if the image is in a private registry. Trivy and Semgrep are unaffected either way; they always scan `path` - IaC misconfig, secrets, and SAST are about source, not the built image. Matches the tool already used for image scanning in this org's release workflows, so there's one CVE-scanning tool org-wide instead of introducing a second. |
 | 4. Summarize Grype findings | Parses the JSON report into a finding count; if Grype crashed (not "found nothing," an actual tool error), marks the lane as failed instead of reporting a false zero. |
 | 5. Run Trivy | `fs` scan with `scanners: secret,misconfig` — secrets and IaC/Dockerfile/K8s misconfig in one pass (vuln scanning is Grype's job, so Trivy's `vuln` scanner is intentionally not enabled). This is what actually covers `deploy`, which is almost entirely Kustomize/K8s YAML. |
 | 6. Summarize Trivy findings | Same crash-vs-clean distinction as step 4. |
-| 7-9. Semgrep SAST | Only runs if `sast` is true (Python/Node/Rust/C# detected). The Semgrep Docker image is cached (`actions/cache`, keyed on the pinned version) and loaded via `docker load` instead of pulled fresh every run — a cold image pull was the single largest per-run cost outside the scans themselves. Runs `semgrep scan --config <semgrep-config> --json`. On `pull_request` events, when `semgrep-diff-aware: true` (the default), also passes `--baseline-commit <PR base SHA>` so only findings introduced since the PR's base commit are reported, instead of every pre-existing finding in the repo on every PR. Checked on the host (not inside the Semgrep image, which isn't guaranteed to have git) with `git cat-file -e <base SHA>` first — if the base commit isn't available locally (shallow checkout, no `fetch-depth: 0`), falls back to a full scan with a `::warning::` rather than failing outright. No effect on `push`/`schedule` events, which always do a full scan. |
+| 7-9. Semgrep SAST | Only runs if `sast` is true (Python/Node/Rust/C# detected). The Semgrep Docker image is cached (`actions/cache`, keyed on the pinned version) and loaded via `docker load` instead of pulled fresh every run — a cold image pull was the single largest per-run cost outside the scans themselves. Runs `semgrep scan --config <semgrep-config> --severity <level> [--severity <level> ...] --json` — the repeated `--severity` flags come from step 2's mapping. On `pull_request` events, when `semgrep-diff-aware: true` (the default), also passes `--baseline-commit <PR base SHA>` so only findings introduced since the PR's base commit are reported, instead of every pre-existing finding in the repo on every PR. Checked on the host (not inside the Semgrep image, which isn't guaranteed to have git) with `git cat-file -e <base SHA>` first — if the base commit isn't available locally (shallow checkout, no `fetch-depth: 0`), falls back to a full scan with a `::warning::` rather than failing outright. No effect on `push`/`schedule` events, which always do a full scan. |
 | 10. Summarize Semgrep findings | Same crash-vs-clean distinction, skipped entirely (not just "0 findings") when `sast` was false. |
 | 11. Evaluate findings (gate) | Sums all three counts. **Fails the job unconditionally if any scanner crashed**, regardless of `fail-on-findings` — a crash is never allowed to look like a clean scan. Only fails on findings (not crashes) when `fail-on-findings: true`. Independently, `fail-on-secrets: true` fails the job if Trivy's secrets count (tracked separately from its misconfig count) is nonzero — lets a repo make just the secrets lane blocking once it scans clean, without needing `fail-on-findings` to cover Grype/misconfig/Semgrep too. |
 | 12. Upload scan reports | The three JSON reports (`grype-results.json`, `trivy-results.json`, `semgrep-results.json`) as a `security-scan-reports` artifact — skipped when there's nothing to show, so a clean run doesn't burn artifact storage. |
@@ -26,7 +26,10 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `path` | no | `.` | Root path to scan |
+| `path` | no | `.` | Root path to scan. Used by Trivy and Semgrep always; used by Grype only when `image` is not set |
+| `image` | no | `''` | Full image reference (e.g. `<registry>/<repo>:<tag>`) for Grype to scan instead of `path` — finds real dependency CVEs in installed site-packages/base OS layers that a directory scan misses. Requires `role-to-assume` and `aws-region` if the image is in a private registry |
+| `role-to-assume` | no | `''` | IAM role ARN to assume via OIDC, for pulling `image` from a private registry. Only used when `image` is set |
+| `aws-region` | no | `''` | AWS region for the ECR login. Only used when `image` is set |
 | `severity-cutoff` | no | `high` | Minimum severity to treat as a finding (`negligible`, `low`, `medium`, `high`, `critical`) — drives both Grype's cutoff and Trivy's severity list |
 | `semgrep-config` | no | `auto` | Semgrep ruleset config (e.g. `auto`, `p/python`, `p/ci`) |
 | `fail-on-findings` | no | `false` | Fail the job if any scanner reports findings (a scanner crash always fails the job regardless of this setting) |
@@ -62,6 +65,25 @@ steps:
 
 > Set `comment-on-pr: 'false'` and drop `pull-requests: write` for workflows that only ever run on `push` (no PR to comment on), or that just want the step summary / artifact without a PR comment.
 
+Scanning a private-registry image additionally needs `permissions: id-token: write` (for the OIDC role assumption) alongside `image`, `role-to-assume`, and `aws-region`:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write   # required when image + role-to-assume are set
+
+steps:
+  - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+  - uses: hakimo-ai/actions/security-scan@v1
+    with:
+      image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/my-app:latest
+      role-to-assume: arn:aws:iam::123456789012:role/my-scan-role
+      aws-region: us-west-2
+      severity-cutoff: 'high'
+```
+
 ## Known, accepted tradeoffs
 
 - **Secrets scanning only covers the current working tree, not git history.** A key that was committed and later removed will not be caught. Trivy was chosen over a dedicated history-scanning tool (Gitleaks) specifically to keep this pipeline fast — see `CLAUDE.md` for the full reasoning if you have access to it. Revisit if this gap ever causes a real incident.
@@ -73,3 +95,4 @@ steps:
 - **This action posts PR comments using a token with `pull-requests: write`.** If a caller ever runs this on `pull_request_target` while also checking out an untrusted fork's PR head in the same job, that fork's content could influence what ends up in a comment posted with your repo's credentials. Prefer plain `pull_request` (which runs with the fork's own reduced-permission token and no secrets) unless you specifically need `pull_request_target`'s access to secrets/write permissions — and if you do, don't combine it with checking out fork content.
 - **A finding IS a disclosure.** If Trivy's secret scanner finds a live credential, the PR comment and the uploaded artifact both now say so, and both are visible to anyone with read access to the repo/PR — which, once this repo (or the calling repo) is public, may be more people than you expect. Treat "found a secret" as "this secret is now compromised": rotate it immediately, don't just delete the comment or the commit.
 - **This action does not modify anything in the target repo.** It only reads files and posts a comment; it has no write access to code, so it cannot itself be a vector for tampering with the repo it scans.
+- **When `image` and `role-to-assume` are both set, this action assumes an AWS IAM role and logs into ECR** to pull the image for Grype to scan — a genuinely different trust profile than the pure static-analysis path-scan mode above. Scope `role-to-assume` to the minimum needed to pull from the specific registry/repo being scanned; don't reuse a broad deploy role just because it's already configured elsewhere in the caller workflow. Leave `role-to-assume` unset to scan a public image with no AWS auth at all.
