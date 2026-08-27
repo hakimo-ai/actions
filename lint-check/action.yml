@@ -148,8 +148,13 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Ruff: failed to run" >> "$GITHUB_STEP_SUMMARY"
         else
-          fmt_count=$(grep -c '^Would reformat:' ruff-format-results.txt 2>/dev/null || echo 0)
-          chk_count=$(jq 'length' ruff-results.json 2>/dev/null || echo 0)
+          # jq/grep are expected to print a single count, but jq in particular
+          # prints one line per top-level JSON value if the file ever ends up
+          # with more than one document (seen in practice) - summing via awk
+          # instead of using the raw value directly keeps $(( )) from crashing
+          # on a multi-line operand instead of just reporting a wrong count.
+          fmt_count=$(grep -c '^Would reformat:' ruff-format-results.txt 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          chk_count=$(jq 'length' ruff-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
           count=$((fmt_count + chk_count))
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
@@ -238,7 +243,7 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "pylint: failed to run" >> "$GITHUB_STEP_SUMMARY"
         else
-          count=$(jq '.messages | length' pylint-results.json 2>/dev/null || echo 0)
+          count=$(jq '.messages | length' pylint-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "pylint findings: $count" >> "$GITHUB_STEP_SUMMARY"
@@ -304,7 +309,7 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "ESLint: failed to run" >> "$GITHUB_STEP_SUMMARY"
         else
-          count=$(jq '[.[].messages[]] | length' eslint-results.json 2>/dev/null || echo 0)
+          count=$(jq '[.[].messages[]] | length' eslint-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "ESLint findings: $count" >> "$GITHUB_STEP_SUMMARY"
@@ -404,8 +409,10 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "cargo fmt/clippy: failed to run" >> "$GITHUB_STEP_SUMMARY"
         else
-          fmt_count=$(grep -c '^Diff in' cargo-fmt-results.txt 2>/dev/null || echo 0)
-          clippy_count=$(jq -s '[.[] | select(.reason == "compiler-message" and (.message.level == "warning" or .message.level == "error"))] | length' cargo-clippy-results.json 2>/dev/null || echo 0)
+          # See the Ruff summary step above for why these go through awk
+          # instead of using the raw jq/grep output directly in $(( )).
+          fmt_count=$(grep -c '^Diff in' cargo-fmt-results.txt 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          clippy_count=$(jq -s '[.[] | select(.reason == "compiler-message" and (.message.level == "warning" or .message.level == "error"))] | length' cargo-clippy-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
           count=$((fmt_count + clippy_count))
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
