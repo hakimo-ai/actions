@@ -170,7 +170,7 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Grype: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
-          count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           if [ -n "$GRYPE_IMAGE" ]; then
@@ -214,8 +214,8 @@ runs:
           # awk instead of feeding raw jq output straight into $(( )) - a
           # multi-document trivy-results.json would otherwise crash this
           # arithmetic instead of just reporting a count.
-          secrets_count=$(jq '[.Results[]? | (.Secrets // [])[]] | length' trivy-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
-          misconfig_count=$(jq '[.Results[]? | (.Misconfigurations // [])[]] | length' trivy-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          secrets_count=$(jq '[.Results[]? | (.Secrets // [])[]] | length' trivy-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
+          misconfig_count=$(jq '[.Results[]? | (.Misconfigurations // [])[]] | length' trivy-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
           count=$((secrets_count + misconfig_count))
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
@@ -290,7 +290,7 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Semgrep: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
-          count=$(jq '.results | length' semgrep-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          count=$(jq '.results | length' semgrep-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Semgrep findings: $count" >> "$GITHUB_STEP_SUMMARY"
