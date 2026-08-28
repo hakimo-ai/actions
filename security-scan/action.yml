@@ -370,11 +370,22 @@ runs:
         SAST_RAN: ${{ steps.detect.outputs.sast }}
         SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
         GRYPE_IMAGE: ${{ inputs.image }}
+        SCAN_PATH: ${{ inputs.path }}
         MAX_FINDINGS: ${{ inputs.max-comment-findings }}
       with:
         script: |
           const fs = require('fs');
-          const marker = '<!-- hakimo-ai/actions/security-scan -->';
+          // Includes the scan target so multiple security-scan calls in the
+          // same PR/push (e.g. a path-mode caller plus an image-mode
+          // security-scan-image job) each get their own comment instead of
+          // racing to overwrite one shared marker - only the last one to
+          // finish used to survive. Same fix as lint-check's own marker
+          // (path-suffixed) for the identical matrix-comment-collision
+          // problem. image takes priority over path since image-mode
+          // callers still pass a path default of '.' that isn't meaningful
+          // to them.
+          const scanKey = process.env.GRYPE_IMAGE || process.env.SCAN_PATH || '.';
+          const marker = `<!-- hakimo-ai/actions/security-scan:${scanKey} -->`;
           const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
           const anyFailed = process.env.ANY_FAILED === 'true';
