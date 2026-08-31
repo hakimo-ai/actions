@@ -46,6 +46,10 @@ inputs:
     description: Max number of individual findings (most severe first) to list in the collapsed detail section of the PR comment
     required: false
     default: '10'
+  scanners:
+    description: Comma-separated allow-list of which scanners to run (grype, trivy, semgrep). Defaults to all three. Lets a caller that only needs one scanner (e.g. an image-mode Grype-only job) skip the others entirely instead of redundantly re-running them - excluded scanners show as "not run (scanners input)" in the summary/comment rather than a false "0 findings".
+    required: false
+    default: 'grype,trivy,semgrep'
 
 outputs:
   findings-count:
@@ -91,6 +95,29 @@ runs:
           echo "| $py | $node | $rust | $csharp | $iac |"
         } >> "$GITHUB_STEP_SUMMARY"
 
+    - name: Parse scanners allow-list
+      id: scanners
+      shell: bash
+      env:
+        SCANNERS: ${{ inputs.scanners }}
+      run: |
+        # Comma-separated allow-list -> one boolean output per scanner, so
+        # every downstream if: and the comment-building JS can gate on
+        # steps.scanners.outputs.<name> instead of re-parsing the string.
+        grype=false; trivy=false; semgrep=false
+        IFS=',' read -ra list <<< "$SCANNERS"
+        for s in "${list[@]}"; do
+          s="$(echo "$s" | xargs)"  # trim whitespace
+          case "$s" in
+            grype) grype=true ;;
+            trivy) trivy=true ;;
+            semgrep) semgrep=true ;;
+          esac
+        done
+        echo "grype=$grype" >> "$GITHUB_OUTPUT"
+        echo "trivy=$trivy" >> "$GITHUB_OUTPUT"
+        echo "semgrep=$semgrep" >> "$GITHUB_OUTPUT"
+
     - name: Map severity threshold for Trivy
       id: severity
       shell: bash
@@ -128,7 +155,7 @@ runs:
     # below in sync with setup-aws/action.yml when either gets bumped.
     - name: Configure AWS credentials for image-mode Grype
       id: aws-configure
-      if: inputs.image != '' && inputs.role-to-assume != ''
+      if: inputs.image != '' && inputs.role-to-assume != '' && steps.scanners.outputs.grype == 'true'
       continue-on-error: true
       uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
       with:
@@ -137,12 +164,13 @@ runs:
 
     - name: Login to Amazon ECR for image-mode Grype
       id: ecr-login
-      if: inputs.image != '' && inputs.role-to-assume != ''
+      if: inputs.image != '' && inputs.role-to-assume != '' && steps.scanners.outputs.grype == 'true'
       continue-on-error: true
       uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2.1.6
 
     - name: Run Grype (dependency CVEs)
       id: grype
+      if: steps.scanners.outputs.grype == 'true'
       continue-on-error: true
       uses: anchore/scan-action@1638637db639e0ade3258b51db49a9a137574c3e  # v6.5.1
       with:
@@ -165,12 +193,21 @@ runs:
         GRYPE_PATH: ${{ inputs.path }}
         SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
       run: |
-        if [ "$GRYPE_OUTCOME" = "failure" ]; then
+        if [ "$GRYPE_OUTCOME" = "skipped" ]; then
+          # Excluded via the scanners input, not a crash - distinct from the
+          # failure branch below so this never gets reported as a scanner
+          # crash, and distinct from a genuine 0-finding clean scan below.
+          echo "ran=false" >> "$GITHUB_OUTPUT"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+        elif [ "$GRYPE_OUTCOME" = "failure" ]; then
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=true" >> "$GITHUB_OUTPUT"
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Grype: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
           count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           if [ -n "$GRYPE_IMAGE" ]; then
@@ -183,6 +220,7 @@ runs:
 
     - name: Run Trivy (secrets + IaC misconfig)
       id: trivy
+      if: steps.scanners.outputs.trivy == 'true'
       continue-on-error: true
       uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
       with:
@@ -201,12 +239,19 @@ runs:
       env:
         TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
       run: |
-        if [ "$TRIVY_OUTCOME" = "failure" ]; then
+        if [ "$TRIVY_OUTCOME" = "skipped" ]; then
+          echo "ran=false" >> "$GITHUB_OUTPUT"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "secrets-count=0" >> "$GITHUB_OUTPUT"
+        elif [ "$TRIVY_OUTCOME" = "failure" ]; then
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=true" >> "$GITHUB_OUTPUT"
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "secrets-count=0" >> "$GITHUB_OUTPUT"
           echo "Trivy: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           # Counted separately (not just combined) so fail-on-secrets can gate
           # on just the secrets lane independent of fail-on-findings, which
           # still gates on the combined secrets+misconfig total below.
@@ -225,14 +270,14 @@ runs:
 
     - name: Restore Semgrep image cache
       id: semgrep-cache
-      if: steps.detect.outputs.sast == 'true'
+      if: steps.detect.outputs.sast == 'true' && steps.scanners.outputs.semgrep == 'true'
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: /tmp/semgrep-image.tar
         key: semgrep-image-1.173.0
 
     - name: Load or pull Semgrep image
-      if: steps.detect.outputs.sast == 'true'
+      if: steps.detect.outputs.sast == 'true' && steps.scanners.outputs.semgrep == 'true'
       shell: bash
       env:
         CACHE_HIT: ${{ steps.semgrep-cache.outputs.cache-hit }}
@@ -247,7 +292,7 @@ runs:
 
     - name: Run Semgrep SAST
       id: semgrep
-      if: steps.detect.outputs.sast == 'true'
+      if: steps.detect.outputs.sast == 'true' && steps.scanners.outputs.semgrep == 'true'
       continue-on-error: true
       shell: bash
       env:
@@ -285,12 +330,19 @@ runs:
       env:
         SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
       run: |
-        if [ "$SEMGREP_OUTCOME" = "failure" ]; then
+        if [ "$SEMGREP_OUTCOME" = "skipped" ]; then
+          # sast was true but excluded via the scanners input.
+          echo "ran=false" >> "$GITHUB_OUTPUT"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+        elif [ "$SEMGREP_OUTCOME" = "failure" ]; then
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=true" >> "$GITHUB_OUTPUT"
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Semgrep: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
           count=$(jq '.results | length' semgrep-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
+          echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=false" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Semgrep findings: $count" >> "$GITHUB_STEP_SUMMARY"
@@ -363,8 +415,11 @@ runs:
       uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
       env:
         GRYPE_FAILED: ${{ steps.grype-summary.outputs.failed }}
+        GRYPE_RAN: ${{ steps.grype-summary.outputs.ran }}
         TRIVY_FAILED: ${{ steps.trivy-summary.outputs.failed }}
+        TRIVY_RAN: ${{ steps.trivy-summary.outputs.ran }}
         SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
+        SEMGREP_RAN: ${{ steps.semgrep-summary.outputs.ran }}
         ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
         FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
         SAST_RAN: ${{ steps.detect.outputs.sast }}
@@ -384,7 +439,20 @@ runs:
           // problem. image takes priority over path since image-mode
           // callers still pass a path default of '.' that isn't meaningful
           // to them.
-          const scanKey = process.env.GRYPE_IMAGE || process.env.SCAN_PATH || '.';
+          //
+          // The tag/digest is stripped from the image reference before use -
+          // image mode's tag is typically dev-<sha> or master-<sha>, which
+          // changes on every single push. Without stripping it, the marker
+          // changed on every push too, so the "find the existing comment"
+          // lookup never matched and every push spawned a brand new comment
+          // instead of editing the last one (confirmed live: 4 pushes to one
+          // PR produced 4 separate image-scan comments). Stripping keeps the
+          // marker stable per image repo across pushes, while still telling
+          // apart genuinely different images if a future caller scans more
+          // than one. Only strips a trailing :tag with no further '/' or ':'
+          // in it, so registry:port prefixes (e.g. localhost:5000/app) are
+          // left alone.
+          const scanKey = (process.env.GRYPE_IMAGE || process.env.SCAN_PATH || '.').replace(/:[^:/]*$/, '');
           const marker = `<!-- hakimo-ai/actions/security-scan:${scanKey} -->`;
           const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
@@ -454,13 +522,18 @@ runs:
               .map((sev) => countBy(findings, (f) => f.tool === tool && f.severity === sev))
               .map((n) => (n > 0 ? String(n) : '-'));
 
-          const scannerRow = (label, tool, failed) =>
-            failed === 'true'
-              ? `| ${label} | | | | | | failed to run - see [logs](${runUrl}) |`
-              : `| ${label} | ${bySeverityCols(tool).join(' | ')} | ${countBy(findings, (f) => f.tool === tool)} |`;
+          // ran === 'false' means excluded via the scanners input - distinct
+          // from both a real crash (failed) and a genuine 0-finding clean
+          // scan, so it gets its own row text instead of a misleading "0".
+          const scannerRow = (label, tool, failed, ran) =>
+            ran === 'false'
+              ? `| ${label} | | | | | | not run - excluded via \`scanners\` input |`
+              : failed === 'true'
+                ? `| ${label} | | | | | | failed to run - see [logs](${runUrl}) |`
+                : `| ${label} | ${bySeverityCols(tool).join(' | ')} | ${countBy(findings, (f) => f.tool === tool)} |`;
 
           const semgrepRow = process.env.SAST_RAN === 'true'
-            ? scannerRow('Semgrep (SAST)', 'Semgrep', process.env.SEMGREP_FAILED)
+            ? scannerRow('Semgrep (SAST)', 'Semgrep', process.env.SEMGREP_FAILED, process.env.SEMGREP_RAN)
             : '| Semgrep (SAST) | | | | | | skipped - no Python/Node/Rust/C# detected |';
 
           // --- Group findings by (tool, rule, severity) so repeated hits of
@@ -516,8 +589,8 @@ runs:
           bodyLines.push(
             '| Scanner | \u{1F534} | \u{1F7E0} | \u{1F7E1} | \u{1F535} | ⚪ | Total |',
             '|---|---|---|---|---|---|---|',
-            scannerRow(`Grype (dependency CVEs, ${grypeTarget}, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED),
-            scannerRow('Trivy (secrets + IaC misconfig)', 'Trivy', process.env.TRIVY_FAILED),
+            scannerRow(`Grype (dependency CVEs, ${grypeTarget}, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED, process.env.GRYPE_RAN),
+            scannerRow('Trivy (secrets + IaC misconfig)', 'Trivy', process.env.TRIVY_FAILED, process.env.TRIVY_RAN),
             semgrepRow,
             '',
           );
