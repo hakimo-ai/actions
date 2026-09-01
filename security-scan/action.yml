@@ -573,11 +573,17 @@ runs:
               ].join('\n')
             : '';
 
+          // Both a source-mode and image-mode call render the same generic
+          // "Security scan - N finding(s)" headline, so without opening the
+          // comment there's no way to tell which one you're looking at -
+          // suffix with (source)/(image), same signal the marker/grypeTarget
+          // below already derive from whether `image` is set.
+          const scanLabel = process.env.GRYPE_IMAGE ? 'image' : 'source';
           const bodyLines = [
             marker,
             anyFailed
-              ? `## \u{1F6E1}\u{FE0F} Security scan — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
-              : `## \u{1F6E1}\u{FE0F} Security scan — ${findings.length} finding(s)`,
+              ? `## \u{1F6E1}\u{FE0F} Security scan (${scanLabel}) — incomplete (${process.env.FAILED_SCANNERS} failed to run)`
+              : `## \u{1F6E1}\u{FE0F} Security scan (${scanLabel}) — ${findings.length} finding(s)`,
             '',
           ];
           if (headerLine) {
