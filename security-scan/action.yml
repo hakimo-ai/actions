@@ -106,8 +106,8 @@ runs:
         # steps.scanners.outputs.<name> instead of re-parsing the string.
         #
         # Fails closed on purpose: an unrecognized entry (typo, e.g. 'gryp')
-        # or an empty/unset SCANNERS (e.g. a caller passing an empty ${{ }}
-        # expression) used to silently match no case arm, leaving all three
+        # or an empty/unset SCANNERS (e.g. a caller passing an empty templated
+        # value) used to silently match no case arm, leaving all three
         # booleans false - every scanner skipped, total-findings=0, job goes
         # green having scanned nothing. Now both cases hard-error instead.
         grype=false; trivy=false; semgrep=false
