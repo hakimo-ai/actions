@@ -104,6 +104,12 @@ runs:
         # Comma-separated allow-list -> one boolean output per scanner, so
         # every downstream if: and the comment-building JS can gate on
         # steps.scanners.outputs.<name> instead of re-parsing the string.
+        #
+        # Fails closed on purpose: an unrecognized entry (typo, e.g. 'gryp')
+        # or an empty/unset SCANNERS (e.g. a caller passing an empty ${{ }}
+        # expression) used to silently match no case arm, leaving all three
+        # booleans false - every scanner skipped, total-findings=0, job goes
+        # green having scanned nothing. Now both cases hard-error instead.
         grype=false; trivy=false; semgrep=false
         IFS=',' read -ra list <<< "$SCANNERS"
         for s in "${list[@]}"; do
@@ -112,8 +118,17 @@ runs:
             grype) grype=true ;;
             trivy) trivy=true ;;
             semgrep) semgrep=true ;;
+            '') : ;;  # tolerate a stray empty entry, e.g. a trailing comma
+            *)
+              echo "::error::scanners input has unrecognized value '$s' - must be a comma-separated list containing only: grype, trivy, semgrep"
+              exit 1
+              ;;
           esac
         done
+        if [ "$grype" = false ] && [ "$trivy" = false ] && [ "$semgrep" = false ]; then
+          echo "::error::scanners input ('$SCANNERS') resolved to no enabled scanners - must include at least one of: grype, trivy, semgrep"
+          exit 1
+        fi
         echo "grype=$grype" >> "$GITHUB_OUTPUT"
         echo "trivy=$trivy" >> "$GITHUB_OUTPUT"
         echo "semgrep=$semgrep" >> "$GITHUB_OUTPUT"
@@ -206,6 +221,29 @@ runs:
           echo "count=0" >> "$GITHUB_OUTPUT"
           echo "Grype: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
         else
+          # anchore/scan-action's severity-cutoff does NOT filter grype-results.json
+          # - per its own input docs, it only sets the SARIF error/warning level and
+          # the fail-build threshold. Every match at every severity is written to
+          # the JSON regardless, so without filtering here the "severity >= X" label
+          # on the comment/summary would be a lie (confirmed: a repo showing 91
+          # >=high findings was reporting 2272, since medium/low/unknown all rode
+          # along uncounted-as-such). Filter in place so every downstream reader of
+          # this file (this count, the PR comment, the uploaded artifact) sees only
+          # what the label promises - same behavior Trivy/Semgrep already have via
+          # their own native severity flags.
+          cutoff_rank=1
+          case "$SEVERITY_CUTOFF" in
+            critical) cutoff_rank=0 ;;
+            high) cutoff_rank=1 ;;
+            medium) cutoff_rank=2 ;;
+            low) cutoff_rank=3 ;;
+            negligible) cutoff_rank=4 ;;
+          esac
+          jq --argjson cutoff "$cutoff_rank" '
+            def rank: {"critical":0,"high":1,"medium":2,"low":3,"negligible":4,"unknown":4}[(.vulnerability.severity // "unknown") | ascii_downcase] // 4;
+            .matches |= map(select(rank <= $cutoff))
+          ' grype-results.json > grype-results.json.filtered 2>/dev/null && mv grype-results.json.filtered grype-results.json
+
           count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
           echo "ran=true" >> "$GITHUB_OUTPUT"
           echo "failed=false" >> "$GITHUB_OUTPUT"
