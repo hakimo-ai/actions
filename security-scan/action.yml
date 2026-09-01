@@ -239,21 +239,45 @@ runs:
             low) cutoff_rank=3 ;;
             negligible) cutoff_rank=4 ;;
           esac
-          jq --argjson cutoff "$cutoff_rank" '
-            def rank: {"critical":0,"high":1,"medium":2,"low":3,"negligible":4,"unknown":4}[(.vulnerability.severity // "unknown") | ascii_downcase] // 4;
-            .matches |= map(select(rank <= $cutoff))
-          ' grype-results.json > grype-results.json.filtered 2>/dev/null && mv grype-results.json.filtered grype-results.json
-
-          count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
-          echo "ran=true" >> "$GITHUB_OUTPUT"
-          echo "failed=false" >> "$GITHUB_OUTPUT"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          if [ -n "$GRYPE_IMAGE" ]; then
-            scan_target="image $GRYPE_IMAGE"
+          # unknown-severity findings (or a missing severity field) always
+          # survive regardless of cutoff, deliberately - Grype marks something
+          # "Unknown" when it couldn't determine severity at all, which could
+          # mean anything up to critical, so silently dropping it at a strict
+          # cutoff would be worse than showing it under a loose one. `rank`
+          # returns null (not a number) for unknown, and `rank == null` in the
+          # select always matches regardless of $cutoff's value.
+          #
+          # Fails closed, not open, if the filter itself breaks (malformed
+          # grype-results.json, disk/OOM issue mid-write): a jq crash here used
+          # to leave grype-results.json unfiltered and untouched (mv skipped),
+          # so the count below would silently revert to the exact inflated,
+          # mislabeled number this filtering exists to prevent - with no
+          # failure signal anywhere. Now treated the same as a Grype process
+          # crash: failed=true, count=0, logged - a filtering failure is never
+          # allowed to look like a clean or a correct scan.
+          if jq --argjson cutoff "$cutoff_rank" '
+            def rank: {"critical":0,"high":1,"medium":2,"low":3,"negligible":4}[(.vulnerability.severity // "unknown") | ascii_downcase];
+            .matches |= map(select(rank == null or rank <= $cutoff))
+          ' grype-results.json > grype-results.json.filtered 2>grype-filter-stderr.txt; then
+            mv grype-results.json.filtered grype-results.json
+            count=$(jq '.matches | length' grype-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "count=$count" >> "$GITHUB_OUTPUT"
+            if [ -n "$GRYPE_IMAGE" ]; then
+              scan_target="image $GRYPE_IMAGE"
+            else
+              scan_target="path $GRYPE_PATH"
+            fi
+            echo "Grype findings ($scan_target, severity >= $SEVERITY_CUTOFF): $count" >> "$GITHUB_STEP_SUMMARY"
           else
-            scan_target="path $GRYPE_PATH"
+            echo "::error::Grype ran but severity filtering crashed (malformed grype-results.json?) - see logs"
+            cat grype-filter-stderr.txt >&2
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "Grype: severity filtering failed (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "Grype findings ($scan_target, severity >= $SEVERITY_CUTOFF): $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Run Trivy (secrets + IaC misconfig)
