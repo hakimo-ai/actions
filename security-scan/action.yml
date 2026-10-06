@@ -1,5 +1,5 @@
 name: Security Scan
-description: Language-aware security scan — auto-detects Python/Node/Rust/C#/IaC and runs Grype, Trivy, and Semgrep accordingly. Open-source tools only, no GitHub Advanced Security dependency.
+description: Language-aware security scan — auto-detects Python/Node/Rust/C#/IaC and runs Grype, Trivy, Semgrep, and yarn audit accordingly. Open-source tools only, no GitHub Advanced Security dependency.
 
 inputs:
   path:
@@ -35,7 +35,11 @@ inputs:
     required: false
     default: 'false'
   semgrep-diff-aware:
-    description: On pull_request events, scan only the diff since the PR's base commit (via Semgrep's --baseline-commit) instead of the whole repo, so pre-existing findings unrelated to the PR don't show up every time. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan.
+    description: On pull_request events, scan only the diff since the PR's base commit (via Semgrep's --baseline-commit) instead of the whole repo, so pre-existing findings unrelated to the PR don't show up every time. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth: 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan.
+    required: false
+    default: 'true'
+  yarn-audit-diff-aware:
+    description: On pull_request events, compare advisory IDs on the PR head vs the base branch and fail only on net-new HIGH/CRITICAL advisories this PR introduces. Pre-existing ones are surfaced as ::notice:: annotations and suppressed. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth: 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan. Only runs when yarn-audit is in the scanners input and a yarn.lock is detected.
     required: false
     default: 'true'
   comment-on-pr:
@@ -47,7 +51,7 @@ inputs:
     required: false
     default: '10'
   scanners:
-    description: Comma-separated allow-list of which scanners to run (grype, trivy, semgrep). Defaults to all three. Lets a caller that only needs one scanner (e.g. an image-mode Grype-only job) skip the others entirely instead of redundantly re-running them - excluded scanners show as "not run (scanners input)" in the summary/comment rather than a false "0 findings".
+    description: Comma-separated allow-list of which scanners to run (grype, trivy, semgrep, yarn-audit). Defaults to grype,trivy,semgrep — yarn-audit is opt-in so existing callers are unaffected until they add it. yarn-audit only runs when yarn.lock is detected; on non-yarn repos it is a no-op regardless. Excluded scanners show as "not run (scanners input)" in the summary/comment rather than a false "0 findings".
     required: false
     default: 'grype,trivy,semgrep'
 
@@ -74,9 +78,10 @@ runs:
           find . "${prune[@]}" -prune -o -maxdepth "$maxdepth" "$@" -print 2>/dev/null | grep -q .
         }
 
-        py=false; node=false; rust=false; csharp=false; iac=false
+        py=false; node=false; yarn=false; rust=false; csharp=false; iac=false
         detect 3 '(' -iname 'requirements*.txt' -o -iname 'pyproject.toml' -o -iname 'setup.py' ')' && py=true
         detect 3 -iname 'package.json' && node=true
+        detect 3 -iname 'yarn.lock' && yarn=true
         detect 4 -iname 'Cargo.toml' && rust=true
         detect 4 '(' -iname '*.csproj' -o -iname '*.sln' ')' && csharp=true
         detect 4 '(' -iname '*.tf' -o -iname 'Dockerfile*' -o -iname 'kustomization.yaml' -o -iname 'kustomization.yml' ')' && iac=true
@@ -84,15 +89,16 @@ runs:
         if [ "$py" = true ] || [ "$node" = true ] || [ "$rust" = true ] || [ "$csharp" = true ]; then sast=true; fi
         echo "python=$py" >> "$GITHUB_OUTPUT"
         echo "node=$node" >> "$GITHUB_OUTPUT"
+        echo "yarn=$yarn" >> "$GITHUB_OUTPUT"
         echo "rust=$rust" >> "$GITHUB_OUTPUT"
         echo "csharp=$csharp" >> "$GITHUB_OUTPUT"
         echo "iac=$iac" >> "$GITHUB_OUTPUT"
         echo "sast=$sast" >> "$GITHUB_OUTPUT"
         {
           echo "### Security scan — detected stack"
-          echo "| Python | Node/JS/TS | Rust | C#/.NET | Dockerfile/Terraform/K8s manifests |"
-          echo "|---|---|---|---|---|"
-          echo "| $py | $node | $rust | $csharp | $iac |"
+          echo "| Python | Node/JS/TS | yarn.lock | Rust | C#/.NET | Dockerfile/Terraform/K8s manifests |"
+          echo "|---|---|---|---|---|---|"
+          echo "| $py | $node | $yarn | $rust | $csharp | $iac |"
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Parse scanners allow-list
@@ -110,7 +116,7 @@ runs:
         # value) used to silently match no case arm, leaving all three
         # booleans false - every scanner skipped, total-findings=0, job goes
         # green having scanned nothing. Now both cases hard-error instead.
-        grype=false; trivy=false; semgrep=false
+        grype=false; trivy=false; semgrep=false; yarn_audit=false
         IFS=',' read -ra list <<< "$SCANNERS"
         for s in "${list[@]}"; do
           s="$(echo "$s" | xargs)"  # trim whitespace
@@ -118,20 +124,22 @@ runs:
             grype) grype=true ;;
             trivy) trivy=true ;;
             semgrep) semgrep=true ;;
+            yarn-audit) yarn_audit=true ;;
             '') : ;;  # tolerate a stray empty entry, e.g. a trailing comma
             *)
-              echo "::error::scanners input has unrecognized value '$s' - must be a comma-separated list containing only: grype, trivy, semgrep"
+              echo "::error::scanners input has unrecognized value '$s' - must be a comma-separated list containing only: grype, trivy, semgrep, yarn-audit"
               exit 1
               ;;
           esac
         done
-        if [ "$grype" = false ] && [ "$trivy" = false ] && [ "$semgrep" = false ]; then
-          echo "::error::scanners input ('$SCANNERS') resolved to no enabled scanners - must include at least one of: grype, trivy, semgrep"
+        if [ "$grype" = false ] && [ "$trivy" = false ] && [ "$semgrep" = false ] && [ "$yarn_audit" = false ]; then
+          echo "::error::scanners input ('$SCANNERS') resolved to no enabled scanners - must include at least one of: grype, trivy, semgrep, yarn-audit"
           exit 1
         fi
         echo "grype=$grype" >> "$GITHUB_OUTPUT"
         echo "trivy=$trivy" >> "$GITHUB_OUTPUT"
         echo "semgrep=$semgrep" >> "$GITHUB_OUTPUT"
+        echo "yarn-audit=$yarn_audit" >> "$GITHUB_OUTPUT"
 
     - name: Map severity threshold for Trivy
       id: severity
@@ -162,6 +170,16 @@ runs:
           *) semgrep_args="--severity ERROR --severity WARNING" ;;
         esac
         echo "semgrep-severity-args=$semgrep_args" >> "$GITHUB_OUTPUT"
+
+        # yarn audit --level flag: maps our scale to yarn's vocabulary.
+        # yarn uses "moderate" where we say "medium".
+        case "$CUTOFF" in
+          critical) yarn_level="critical" ;;
+          high)     yarn_level="high" ;;
+          medium)   yarn_level="moderate" ;;
+          *)        yarn_level="low" ;;
+        esac
+        echo "yarn-audit-level=$yarn_level" >> "$GITHUB_OUTPUT"
 
     # Duplicated from setup-aws/action.yml rather than calling it directly -
     # setup-aws bundles its own checkout and requires role-to-assume/aws-region,
@@ -410,6 +428,133 @@ runs:
           echo "Semgrep findings: $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
+    # yarn audit queries the npm advisory DB directly - some advisories land
+    # there weeks before they reach GHSA/NVD (Grype's source), so the two
+    # scanners are genuinely complementary rather than redundant. Only runs
+    # when yarn.lock is detected; npm-only repos are unaffected.
+    # On PR events with yarn-audit-diff-aware: true, only advisories introduced
+    # by this PR cause a failure - pre-existing ones are suppressed as notices.
+    - name: Run yarn audit (npm advisory DB)
+      id: yarn-audit
+      if: steps.detect.outputs.yarn == 'true' && steps.scanners.outputs.yarn-audit == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        DIFF_AWARE: ${{ inputs.yarn-audit-diff-aware }}
+        YARN_LEVEL: ${{ steps.severity.outputs.yarn-audit-level }}
+      run: |
+        set -euo pipefail
+
+        run_audit() {
+          yarn audit --json --level "$YARN_LEVEL" 2>/dev/null > "$1" || true
+        }
+
+        parse_ids() {
+          python3 -c '
+        import json, sys
+        ids = set()
+        for line in open(sys.argv[1]):
+            try:
+                d = json.loads(line.strip())
+                if d.get("type") == "auditAdvisory":
+                    ids.add(str(d["data"]["advisory"]["id"]))
+            except Exception:
+                pass
+        print(" ".join(sorted(ids)))
+        ' "$1"
+        }
+
+        write_results() {
+          python3 -c '
+        import json, sys
+        src, keep_str, out = sys.argv[1], sys.argv[2], sys.argv[3]
+        keep = set(keep_str.split())
+        result, seen = [], set()
+        for line in open(src):
+            try:
+                d = json.loads(line.strip())
+                if d.get("type") == "auditAdvisory":
+                    a = d["data"]["advisory"]
+                    aid = str(a["id"])
+                    if aid in keep and aid not in seen:
+                        seen.add(aid)
+                        ver = ((a.get("findings") or [{}])[0]).get("version", "?")
+                        result.append({
+                            "id": aid, "severity": a.get("severity", "unknown"),
+                            "title": a.get("title", ""), "module_name": a.get("module_name", ""),
+                            "version": ver, "url": a.get("url", "")
+                        })
+            except Exception:
+                pass
+        json.dump({"advisories": result}, open(out, "w"))
+        ' "$1" "$2" "$3"
+        }
+
+        if [ "$EVENT_NAME" = "pull_request" ] && [ "$DIFF_AWARE" = "true" ] && [ -n "$BASE_SHA" ]; then
+          if ! git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            echo "::warning::yarn-audit-diff-aware is enabled but base commit $BASE_SHA isn't available locally (checkout needs fetch-depth: 0) - falling back to a full scan"
+            run_audit pr-audit.ndjson
+            all_ids=$(parse_ids pr-audit.ndjson)
+            write_results pr-audit.ndjson "$all_ids" yarn-audit-results.json
+          else
+            run_audit pr-audit.ndjson
+            git checkout "$BASE_SHA" -- package.json yarn.lock 2>/dev/null || true
+            run_audit base-audit.ndjson
+            git checkout HEAD -- package.json yarn.lock 2>/dev/null || true
+
+            pr_ids=$(parse_ids pr-audit.ndjson)
+            base_ids=$(parse_ids base-audit.ndjson)
+
+            # Print pre-existing notices to stdout (GHA picks up ::notice:: from stdout),
+            # write new IDs to a file to avoid capturing the notice lines in a subshell.
+            python3 -c '
+        import json, sys
+        base = set(sys.argv[1].split())
+        pr   = set(sys.argv[2].split())
+        pre, new = sorted(pr & base), sorted(pr - base)
+        if pre:
+            print("::notice::yarn audit: " + str(len(pre)) + " pre-existing advisory(ies) suppressed: #" + ", #".join(pre))
+        with open("yarn-audit-new-ids.txt", "w") as f:
+            f.write(" ".join(new))
+        ' "$base_ids" "$pr_ids"
+
+            new_ids=$(cat yarn-audit-new-ids.txt)
+            write_results pr-audit.ndjson "$new_ids" yarn-audit-results.json
+          fi
+        else
+          run_audit pr-audit.ndjson
+          all_ids=$(parse_ids pr-audit.ndjson)
+          write_results pr-audit.ndjson "$all_ids" yarn-audit-results.json
+        fi
+
+    - name: Summarize yarn audit findings
+      id: yarn-audit-summary
+      if: always()
+      shell: bash
+      env:
+        YARN_AUDIT_OUTCOME: ${{ steps.yarn-audit.outcome }}
+        YARN_DETECTED: ${{ steps.detect.outputs.yarn }}
+        YARN_AUDIT_ENABLED: ${{ steps.scanners.outputs.yarn-audit }}
+      run: |
+        if [ "${YARN_DETECTED:-false}" = "false" ] || [ "${YARN_AUDIT_ENABLED:-false}" = "false" ]; then
+          echo "ran=false" >> "$GITHUB_OUTPUT"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+        elif [ "$YARN_AUDIT_OUTCOME" = "failure" ]; then
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "yarn audit: scan failed to run (see logs) — findings below are incomplete" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(python3 -c 'import json; d=json.load(open("yarn-audit-results.json")); print(len(d.get("advisories", [])))' 2>/dev/null || echo 0)
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "yarn audit findings (npm advisory DB): $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: Evaluate findings
       id: gate
       if: always()
@@ -422,17 +567,20 @@ runs:
         TRIVY_FAILED: ${{ steps.trivy-summary.outputs.failed }}
         SEMGREP_COUNT: ${{ steps.semgrep-summary.outputs.count }}
         SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
+        YARN_AUDIT_COUNT: ${{ steps.yarn-audit-summary.outputs.count }}
+        YARN_AUDIT_FAILED: ${{ steps.yarn-audit-summary.outputs.failed }}
         SAST_RAN: ${{ steps.detect.outputs.sast }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
         FAIL_ON_SECRETS: ${{ inputs.fail-on-secrets }}
       run: |
-        total=$(( ${GRYPE_COUNT:-0} + ${TRIVY_COUNT:-0} + ${SEMGREP_COUNT:-0} ))
+        total=$(( ${GRYPE_COUNT:-0} + ${TRIVY_COUNT:-0} + ${SEMGREP_COUNT:-0} + ${YARN_AUDIT_COUNT:-0} ))
         echo "total-findings=$total" >> "$GITHUB_OUTPUT"
 
         failed=""
         [ "${GRYPE_FAILED:-false}" = "true" ] && failed="${failed}Grype,"
         [ "${TRIVY_FAILED:-false}" = "true" ] && failed="${failed}Trivy,"
         if [ "$SAST_RAN" = "true" ] && [ "${SEMGREP_FAILED:-false}" = "true" ]; then failed="${failed}Semgrep,"; fi
+        [ "${YARN_AUDIT_FAILED:-false}" = "true" ] && failed="${failed}yarn audit,"
         failed="${failed%,}"
 
         if [ -n "$failed" ]; then
@@ -445,7 +593,7 @@ runs:
         fi
 
         if [ "$total" -gt 0 ]; then
-          echo "Security scan found $total finding(s) across Grype, Trivy, and Semgrep."
+          echo "Security scan found $total finding(s) across Grype, Trivy, Semgrep, and yarn audit."
         else
           echo "No findings."
         fi
@@ -469,6 +617,7 @@ runs:
           grype-results.json
           trivy-results.json
           semgrep-results.json
+          yarn-audit-results.json
         if-no-files-found: ignore
         retention-days: 30
 
@@ -482,6 +631,9 @@ runs:
         TRIVY_RAN: ${{ steps.trivy-summary.outputs.ran }}
         SEMGREP_FAILED: ${{ steps.semgrep-summary.outputs.failed }}
         SEMGREP_RAN: ${{ steps.semgrep-summary.outputs.ran }}
+        YARN_AUDIT_FAILED: ${{ steps.yarn-audit-summary.outputs.failed }}
+        YARN_AUDIT_RAN: ${{ steps.yarn-audit-summary.outputs.ran }}
+        YARN_DETECTED: ${{ steps.detect.outputs.yarn }}
         ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
         FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
         SAST_RAN: ${{ steps.detect.outputs.sast }}
@@ -531,9 +683,9 @@ runs:
           const asArray = (v) => (Array.isArray(v) ? v : []);
 
           // Each tool has its own severity vocabulary (Grype: Critical/High/...,
-          // Trivy: CRITICAL/HIGH/..., Semgrep: ERROR/WARNING/INFO) - normalized
-          // into one 5-bucket scale so the header/table/emoji are consistent
-          // across all three scanners.
+          // Trivy: CRITICAL/HIGH/..., Semgrep: ERROR/WARNING/INFO,
+          // yarn audit: critical/high/moderate/low) - normalized into one
+          // 5-bucket scale so the header/table/emoji are consistent across all.
           const SEVERITY_BUCKETS = {
             critical: 'critical', error: 'critical',
             high: 'high',
@@ -568,6 +720,10 @@ runs:
             }
           }
 
+          for (const a of asArray(readJson('yarn-audit-results.json')?.advisories)) {
+            push('yarn audit', a.severity, `npm-advisory-${a.id}`, `in \`${a.module_name || '?'}@${a.version || '?'}\` — ${a.title || ''}`);
+          }
+
           // --- Severity breakdown, overall and per-scanner (drives the header
           // line and the per-scanner table columns) ---
           const countBy = (list, pred) => list.filter(pred).length;
@@ -597,6 +753,13 @@ runs:
           const semgrepRow = process.env.SAST_RAN === 'true'
             ? scannerRow('Semgrep (SAST)', 'Semgrep', process.env.SEMGREP_FAILED, process.env.SEMGREP_RAN)
             : '| Semgrep (SAST) | | | | | | skipped - no Python/Node/Rust/C# detected |';
+
+          // yarn audit row: if no yarn.lock was detected it never ran regardless
+          // of the scanners input, so show a "skipped" message rather than
+          // "not run via scanners" which implies it was deliberately excluded.
+          const yarnAuditRow = process.env.YARN_DETECTED !== 'true'
+            ? '| yarn audit (npm advisory DB) | | | | | | skipped - no yarn.lock detected |'
+            : scannerRow('yarn audit (npm advisory DB)', 'yarn audit', process.env.YARN_AUDIT_FAILED, process.env.YARN_AUDIT_RAN);
 
           // --- Group findings by (tool, rule, severity) so repeated hits of
           // the same rule (e.g. one Semgrep check firing on 27 near-identical
@@ -660,6 +823,7 @@ runs:
             scannerRow(`Grype (dependency CVEs, ${grypeTarget}, severity >= ${process.env.SEVERITY_CUTOFF})`, 'Grype', process.env.GRYPE_FAILED, process.env.GRYPE_RAN),
             scannerRow('Trivy (secrets + IaC misconfig)', 'Trivy', process.env.TRIVY_FAILED, process.env.TRIVY_RAN),
             semgrepRow,
+            yarnAuditRow,
             '',
           );
           if (detailsBlock) {
