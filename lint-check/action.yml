@@ -1,5 +1,5 @@
 name: Lint Check
-description: Language-aware lint/format check. Detects Python/Node/Rust in the target repo and runs the matching linter; C#/Go/C++ are detected but intentionally out of scope (see README). Optionally runs cargo test for Rust via run-tests.
+description: Language-aware lint/format check. Detects Python/Node/Rust/Dockerfiles in the target repo and runs the matching linter; C#/Go/C++ are detected but intentionally out of scope (see README). Optionally runs cargo test for Rust via run-tests.
 
 inputs:
   path:
@@ -70,7 +70,7 @@ runs:
           find . "${prune[@]}" -prune -o -maxdepth 6 -type f \( "$@" \) -print -quit
         }
 
-        python="false"; node="false"; rust="false"; csharp="false"; go="false"; cpp="false"; yaml="false"
+        python="false"; node="false"; rust="false"; csharp="false"; go="false"; cpp="false"; yaml="false"; dockerfile="false"
         eslint="false"; prettier="false"; pkg_manager="npm"
 
         [ -n "$(detect -iname 'requirements*.txt' -o -iname 'pyproject.toml' -o -iname 'setup.py')" ] && python="true"
@@ -80,6 +80,7 @@ runs:
         [ -n "$(detect -iname '*.go')" ] && go="true"
         [ -n "$(detect -iname '*.cpp' -o -iname '*.cc' -o -iname '*.hpp' -o -iname '*.h')" ] && cpp="true"
         [ -n "$(detect -iname '*.yml' -o -iname '*.yaml')" ] && yaml="true"
+        [ -n "$(detect -iname 'Dockerfile' -o -iname 'Dockerfile.*')" ] && dockerfile="true"
 
         if [ "$node" = "true" ]; then
           [ -n "$(detect -iname '.eslintrc*' -o -iname 'eslint.config.*')" ] && eslint="true"
@@ -102,12 +103,13 @@ runs:
           echo "go=$go"
           echo "cpp=$cpp"
           echo "yaml=$yaml"
+          echo "dockerfile=$dockerfile"
           echo "eslint=$eslint"
           echo "prettier=$prettier"
           echo "pkg-manager=$pkg_manager"
         } >> "$GITHUB_OUTPUT"
 
-        echo "Detected: python=$python node=$node(eslint=$eslint,prettier=$prettier) rust=$rust csharp=$csharp go=$go cpp=$cpp yaml=$yaml" >> "$GITHUB_STEP_SUMMARY"
+        echo "Detected: python=$python node=$node(eslint=$eslint,prettier=$prettier) rust=$rust csharp=$csharp go=$go cpp=$cpp yaml=$yaml dockerfile=$dockerfile" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Setup Python
       if: steps.detect.outputs.python == 'true' || steps.detect.outputs.yaml == 'true'
@@ -517,6 +519,80 @@ runs:
           echo "yamllint findings: $count" >> "$GITHUB_STEP_SUMMARY"
         fi
 
+    - name: Run hadolint
+      id: hadolint
+      if: steps.detect.outputs.dockerfile == 'true'
+      continue-on-error: true
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        # Not on PyPI/npm - hadolint ships as standalone per-platform binaries from
+        # its own GitHub releases, pinned by version + sha256 (published by the
+        # hadolint project's own checksums.sha256 release asset) rather than via a
+        # package manager's own integrity check like the pip-installed tools above.
+        # This composite action can run on Linux or macOS runners (e.g. a caller
+        # repo using macos-latest for iOS builds), so the asset/checksum must be
+        # picked per-platform - a single hardcoded linux binary would silently
+        # exec-format-error on macOS.
+        HADOLINT_VERSION="2.15.1"
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   HADOLINT_ASSET="hadolint-linux-x86_64";  HADOLINT_SHA256="c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507" ;;
+          Linux-ARM64) HADOLINT_ASSET="hadolint-linux-arm64";   HADOLINT_SHA256="f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d" ;;
+          macOS-X64)   HADOLINT_ASSET="hadolint-macos-x86_64";  HADOLINT_SHA256="ffe9bb18b23d5ed1eae50237aecdbb523d016e96da0bd4e7aa432040acfc3fde" ;;
+          macOS-ARM64) HADOLINT_ASSET="hadolint-macos-arm64";   HADOLINT_SHA256="5c09f3213f8e40406abe048233d985eebef336d4a6a20021be47fadb6cf480a2" ;;
+          *)
+            echo "::error::hadolint: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH} (no pinned binary for this platform)"
+            exit 1
+            ;;
+        esac
+        HADOLINT_BIN="$RUNNER_TEMP/hadolint"
+
+        curl -sL -o "$HADOLINT_BIN" "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/${HADOLINT_ASSET}"
+        echo "${HADOLINT_SHA256}  $HADOLINT_BIN" | shasum -a 256 -c -
+        chmod +x "$HADOLINT_BIN"
+
+        prune=( '(' -path '*/node_modules' -o -path '*/.git' -o -path '*/target' -o -path '*/dist' -o -path '*/build' -o -path '*/.venv' ')' )
+        # Avoids `mapfile`/`readarray` (bash 4+ only) - this composite action can be
+        # invoked from a macos-latest runner (bash 3.2 is still the system /bin/bash
+        # there), so a while-read loop is used for compatibility with both.
+        dockerfiles=()
+        while IFS= read -r f; do
+          dockerfiles+=("$f")
+        done < <(find . "${prune[@]}" -prune -o -maxdepth 6 -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' \) -print)
+
+        set +e
+        "$HADOLINT_BIN" -f json "${dockerfiles[@]}" > hadolint-results.json 2>hadolint-stderr.txt
+        code=$?
+        set -e
+
+        # hadolint: 0 = clean. Findings and a genuine crash (bad arg, unreadable
+        # file) share the same exit code 1, so - same convention as the clippy/
+        # cargo-test crash-vs-findings checks above - only trust a non-zero exit
+        # as "just findings" when the JSON output actually parses; anything else
+        # is a real tool failure.
+        if [ "$code" -ne 0 ] && ! jq empty hadolint-results.json 2>/dev/null; then
+          echo "::error::hadolint exited abnormally ($code) - see logs"
+          cat hadolint-stderr.txt >&2
+          exit 1
+        fi
+
+    - name: Summarize hadolint findings
+      id: hadolint-summary
+      if: always() && steps.detect.outputs.dockerfile == 'true'
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        if [ "${{ steps.hadolint.outcome }}" != "success" ]; then
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "hadolint: failed to run" >> "$GITHUB_STEP_SUMMARY"
+        else
+          count=$(jq 'length' hadolint-results.json 2>/dev/null | awk '{s+=$1} END {print s+0}') || true
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "hadolint findings: $count" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: Evaluate findings
       id: gate
       if: always()
@@ -539,9 +615,11 @@ runs:
         RUST_TEST_FAILED: ${{ steps.rust-test-summary.outputs.failed }}
         YAML_COUNT: ${{ steps.yamllint-summary.outputs.count }}
         YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
+        HADOLINT_COUNT: ${{ steps.hadolint-summary.outputs.count }}
+        HADOLINT_FAILED: ${{ steps.hadolint-summary.outputs.failed }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
-        total=$(( ${RUFF_COUNT:-0} + ${MYPY_COUNT:-0} + ${PYLINT_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${RUST_TEST_COUNT:-0} + ${YAML_COUNT:-0} ))
+        total=$(( ${RUFF_COUNT:-0} + ${MYPY_COUNT:-0} + ${PYLINT_COUNT:-0} + ${ESLINT_COUNT:-0} + ${PRETTIER_COUNT:-0} + ${RUST_COUNT:-0} + ${RUST_TEST_COUNT:-0} + ${YAML_COUNT:-0} + ${HADOLINT_COUNT:-0} ))
 
         failed_scanners=""
         any_failed="false"
@@ -552,7 +630,8 @@ runs:
                     "Prettier:${PRETTIER_FAILED:-false}" \
                     "cargo fmt/clippy:${RUST_FAILED:-false}" \
                     "cargo test:${RUST_TEST_FAILED:-false}" \
-                    "yamllint:${YAML_FAILED:-false}"; do
+                    "yamllint:${YAML_FAILED:-false}" \
+                    "hadolint:${HADOLINT_FAILED:-false}"; do
           name="${pair%%:*}"
           val="${pair#*:}"
           if [ "$val" = "true" ]; then
@@ -594,6 +673,7 @@ runs:
           ${{ inputs.path }}/cargo-clippy-stderr.txt
           ${{ inputs.path }}/cargo-test-results.txt
           ${{ inputs.path }}/yamllint-results.txt
+          ${{ inputs.path }}/hadolint-results.json
         if-no-files-found: ignore
         retention-days: 30
 
@@ -612,6 +692,7 @@ runs:
         RUST_TEST_RAN: ${{ inputs.run-tests }}
         RUST_TEST_FAILED: ${{ steps.rust-test-summary.outputs.failed }}
         YAML_FAILED: ${{ steps.yamllint-summary.outputs.failed }}
+        HADOLINT_FAILED: ${{ steps.hadolint-summary.outputs.failed }}
         ANY_FAILED: ${{ steps.gate.outputs.any-failed }}
         FAILED_SCANNERS: ${{ steps.gate.outputs.failed-scanners }}
         PYTHON_RAN: ${{ steps.detect.outputs.python }}
@@ -620,6 +701,7 @@ runs:
         PRETTIER_RAN: ${{ steps.detect.outputs.prettier }}
         RUST_RAN: ${{ steps.detect.outputs.rust }}
         YAML_RAN: ${{ steps.detect.outputs.yaml }}
+        DOCKERFILE_RAN: ${{ steps.detect.outputs.dockerfile }}
         CSHARP_DETECTED: ${{ steps.detect.outputs.csharp }}
         GO_DETECTED: ${{ steps.detect.outputs.go }}
         CPP_DETECTED: ${{ steps.detect.outputs.cpp }}
@@ -729,6 +811,12 @@ runs:
             }
           }
 
+          if (process.env.DOCKERFILE_RAN === 'true') {
+            for (const f of asArray(readJson('hadolint-results.json'))) {
+              push('hadolint', f.level, `**hadolint** \`${f.code || 'unknown'}\` ${f.message || ''} in \`${f.file || '?'}:${f.line ?? '?'}\``);
+            }
+          }
+
           const SEVERITY_RANK = { error: 0, warning: 1 };
           const rank = (s) => SEVERITY_RANK[String(s || '').toLowerCase()] ?? 2;
           findings.sort((a, b) => rank(a.severity) - rank(b.severity));
@@ -794,6 +882,11 @@ runs:
           rows.push(
             process.env.YAML_RAN === 'true'
               ? scannerRow('yamllint', countByTool('yamllint'), process.env.YAML_FAILED)
+              : null,
+          );
+          rows.push(
+            process.env.DOCKERFILE_RAN === 'true'
+              ? scannerRow('hadolint (Dockerfile)', countByTool('hadolint'), process.env.HADOLINT_FAILED)
               : null,
           );
 
