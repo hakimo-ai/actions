@@ -39,11 +39,11 @@ inputs:
     required: false
     default: 'true'
   grype-diff-aware:
-    description: On pull_request events (dir-mode only, not image-mode), suppress pre-existing CVEs so they don't block unrelated PRs. anchore/scan-action scans the PR head first; this step then scans the base-branch manifests, computes the diff, and overwrites grype-results.json with only net-new findings. Pre-existing ones are surfaced as ::notice:: annotations. Requires enough git history in the caller's checkout (e.g. actions/checkout with fetch-depth 0) - falls back to showing all findings with a warning if the base commit isn't available locally. No effect on push/schedule events or image-mode scans.
+    description: On pull_request events (dir-mode only, not image-mode), suppress pre-existing CVEs so they don't block unrelated PRs. anchore/scan-action scans the PR head first; this step then scans the base-branch manifests, computes the diff, and overwrites grype-results.json with only net-new findings. Pre-existing ones are surfaced as notice-level annotations. Requires enough git history in the caller's checkout (e.g. actions/checkout with fetch-depth 0) - falls back to showing all findings with a warning if the base commit isn't available locally. No effect on push/schedule events or image-mode scans.
     required: false
     default: 'true'
   yarn-audit-diff-aware:
-    description: On pull_request events, compare advisory IDs on the PR head vs the base branch and fail only on net-new HIGH/CRITICAL advisories this PR introduces. Pre-existing ones are surfaced as ::notice:: annotations and suppressed. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan. Only runs when yarn-audit is in the scanners input and a yarn.lock is detected.
+    description: On pull_request events, compare advisory IDs on the PR head vs the base branch and fail only on net-new HIGH/CRITICAL advisories this PR introduces. Pre-existing ones are surfaced as notice-level annotations and suppressed. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan. Only runs when yarn-audit is in the scanners input and a yarn.lock is detected.
     required: false
     default: 'true'
   comment-on-pr:
