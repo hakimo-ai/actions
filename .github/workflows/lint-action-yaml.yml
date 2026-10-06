@@ -1,0 +1,21 @@
+name: Lint action YAML
+
+on:
+  pull_request:
+    paths:
+      - '**/action.yml'
+      - '.yamllint.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - '**/action.yml'
+      - '.yamllint.yml'
+
+jobs:
+  yamllint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install yamllint
+      - run: yamllint -c .yamllint.yml $(find . -name 'action.yml' | sort)
