@@ -38,6 +38,10 @@ inputs:
     description: On pull_request events, scan only the diff since the PR's base commit (via Semgrep's --baseline-commit) instead of the whole repo, so pre-existing findings unrelated to the PR don't show up every time. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth: 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan.
     required: false
     default: 'true'
+  grype-diff-aware:
+    description: On pull_request events (dir-mode only, not image-mode), suppress pre-existing CVEs so they don't block unrelated PRs. anchore/scan-action scans the PR head first; this step then scans the base-branch manifests, computes the diff, and overwrites grype-results.json with only net-new findings. Pre-existing ones are surfaced as ::notice:: annotations. Requires enough git history in the caller's checkout (e.g. actions/checkout with fetch-depth: 0) - falls back to showing all findings with a warning if the base commit isn't available locally. No effect on push/schedule events or image-mode scans.
+    required: false
+    default: 'true'
   yarn-audit-diff-aware:
     description: On pull_request events, compare advisory IDs on the PR head vs the base branch and fail only on net-new HIGH/CRITICAL advisories this PR introduces. Pre-existing ones are surfaced as ::notice:: annotations and suppressed. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth: 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan. Only runs when yarn-audit is in the scanners input and a yarn.lock is detected.
     required: false
@@ -215,6 +219,64 @@ runs:
         output-file: grype-results.json
         severity-cutoff: ${{ inputs.severity-cutoff }}
         fail-build: 'false'
+
+    # Runs after anchore/scan-action so grype-results.json for the PR head
+    # already exists. Scans the base-branch manifests, computes new CVE IDs,
+    # and overwrites grype-results.json with only those - the summary step
+    # downstream sees only net-new findings and counts/comments accordingly.
+    # continue-on-error: if the filter crashes, the unfiltered results (all
+    # findings) survive rather than the job silently going green.
+    - name: Grype diff-aware filter
+      if: steps.grype.outcome == 'success' && github.event_name == 'pull_request' && inputs.grype-diff-aware == 'true' && inputs.image == ''
+      continue-on-error: true
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        SCAN_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+
+        if ! git cat-file -e "$BASE_SHA" 2>/dev/null; then
+          echo "::warning::grype-diff-aware is enabled but base commit $BASE_SHA isn't available locally (checkout needs fetch-depth: 0) - showing all findings without suppression"
+          exit 0
+        fi
+
+        grype_version="0.97.1"
+        curl -fsSL "https://github.com/anchore/grype/releases/download/v${grype_version}/grype_${grype_version}_linux_amd64.tar.gz" \
+          | tar xzf - -C /usr/local/bin grype
+
+        # Only check out manifest files that changed between base and this PR -
+        # no need to restore the whole tree, just the files grype dir: reads.
+        changed_manifests=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null \
+          | grep -E '(^|/)((package|package-lock)\.json|yarn\.lock|Cargo\.(toml|lock)|go\.(mod|sum)|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|requirements[^/]*\.txt)$' \
+          || true)
+
+        if [ -n "$changed_manifests" ]; then
+          # shellcheck disable=SC2086
+          git checkout "$BASE_SHA" -- $changed_manifests 2>/dev/null || true
+          grype "dir:$SCAN_PATH" -o json --file grype-base.json
+          # shellcheck disable=SC2086
+          git checkout HEAD -- $changed_manifests 2>/dev/null || true
+        else
+          echo '{"matches":[]}' > grype-base.json
+        fi
+
+        # Compare PR head findings (already in grype-results.json) against base.
+        # Overwrite grype-results.json with only net-new matches so the summary
+        # step counts/comments on new findings only.
+        python3 -c '
+        import json, sys
+        pr_data = json.load(open("grype-results.json"))
+        base_ids = {m["vulnerability"]["id"] for m in json.load(open("grype-base.json")).get("matches", [])}
+        pr_matches = pr_data.get("matches", [])
+        pre = sorted({m["vulnerability"]["id"] for m in pr_matches} & base_ids)
+        new_matches = [m for m in pr_matches if m["vulnerability"]["id"] not in base_ids]
+        if pre:
+            print("::notice::Grype: " + str(len(pre)) + " pre-existing finding(s) suppressed: " + ", ".join(pre))
+        pr_data["matches"] = new_matches
+        json.dump(pr_data, open("grype-results.json", "w"))
+        print("Grype diff: " + str(len(new_matches)) + " new finding(s), " + str(len(pre)) + " pre-existing suppressed")
+        '
 
     - name: Summarize Grype findings
       id: grype-summary
