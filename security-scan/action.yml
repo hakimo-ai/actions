@@ -46,6 +46,15 @@ inputs:
     description: On pull_request events, compare advisory IDs on the PR head vs the base branch and fail only on net-new HIGH/CRITICAL advisories this PR introduces. Pre-existing ones are surfaced as notice-level annotations and suppressed. Requires enough git history in the caller's checkout to include the base commit (e.g. actions/checkout with fetch-depth 0) - falls back to a full scan with a warning if the base commit isn't available locally. No effect on push/schedule events, which always do a full scan. Only runs when yarn-audit is in the scanners input and a yarn.lock is detected.
     required: false
     default: 'true'
+  yarn-audit-ignore:
+    description: >
+      Comma or newline-separated list of npm advisory IDs to suppress, each with a
+      mandatory expiry date in the format ID:YYYY-MM-DD. Unexpired entries are suppressed
+      as ::notice:: annotations. Expired entries are treated as real findings again and
+      emit a ::warning:: so the ignore is not forgotten. Example:
+      "1139346:2026-11-07,1240992:2026-11-07"
+    required: false
+    default: ''
   comment-on-pr:
     description: "Post/update a PR comment with the findings summary (requires 'pull-requests: write' in the caller). No-op outside pull_request/pull_request_target events."
     required: false
@@ -506,8 +515,41 @@ runs:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         DIFF_AWARE: ${{ inputs.yarn-audit-diff-aware }}
         YARN_LEVEL: ${{ steps.severity.outputs.yarn-audit-level }}
+        YARN_AUDIT_IGNORE: ${{ inputs.yarn-audit-ignore }}
       run: |
         set -euo pipefail
+
+        # Filters IDs against the ignore list. Emits ::notice:: for active suppressed
+        # entries and ::warning:: for expired ones. Writes filtered IDs to
+        # yarn-filtered-ids.txt for the caller to read.
+        apply_yarn_ignore() {
+          python3 -c '
+        import sys, os
+        from datetime import date
+        ids = set(sys.argv[1].split()) if sys.argv[1] else set()
+        ign = os.environ.get("YARN_AUDIT_IGNORE", "")
+        today = date.today()
+        act, exp_d = {}, {}
+        for e in ign.replace("\n", ",").split(","):
+            e = e.strip()
+            if not e: continue
+            if ":" in e:
+                a, _, d = e.rpartition(":")
+                try:
+                    dt = date.fromisoformat(d.strip())
+                    (act if today < dt else exp_d)[a.strip()] = d.strip()
+                except ValueError:
+                    act[a.strip()] = "no-expiry"
+            else:
+                act[e] = "no-expiry"
+        sup = sorted(ids & set(act))
+        exf = sorted(ids & set(exp_d))
+        kept = sorted(ids - set(act))
+        for i in sup: print("::notice::yarn audit: advisory #" + i + " ignored until " + act[i])
+        for i in exf: print("::warning::yarn audit: ignore for advisory #" + i + " expired " + exp_d[i] + " - treating as real finding")
+        open("yarn-filtered-ids.txt", "w").write(" ".join(kept))
+        ' "$1"
+        }
 
         run_audit() {
           yarn audit --json --level "$YARN_LEVEL" 2>/dev/null > "$1" || true
@@ -559,6 +601,8 @@ runs:
             echo "::warning::yarn-audit-diff-aware is enabled but base commit $BASE_SHA isn't available locally (checkout needs fetch-depth: 0) - falling back to a full scan"
             run_audit pr-audit.ndjson
             all_ids=$(parse_ids pr-audit.ndjson)
+            apply_yarn_ignore "$all_ids"
+            all_ids=$(cat yarn-filtered-ids.txt)
             write_results pr-audit.ndjson "$all_ids" yarn-audit-results.json
           else
             run_audit pr-audit.ndjson
@@ -583,11 +627,15 @@ runs:
         ' "$base_ids" "$pr_ids"
 
             new_ids=$(cat yarn-audit-new-ids.txt)
+            apply_yarn_ignore "$new_ids"
+            new_ids=$(cat yarn-filtered-ids.txt)
             write_results pr-audit.ndjson "$new_ids" yarn-audit-results.json
           fi
         else
           run_audit pr-audit.ndjson
           all_ids=$(parse_ids pr-audit.ndjson)
+          apply_yarn_ignore "$all_ids"
+          all_ids=$(cat yarn-filtered-ids.txt)
           write_results pr-audit.ndjson "$all_ids" yarn-audit-results.json
         fi
 
