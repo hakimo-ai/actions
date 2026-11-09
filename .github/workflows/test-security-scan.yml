@@ -1,0 +1,100 @@
+# End-to-end smoke test for the security-scan action: actually invokes it
+# against seeded fixtures (security-scan/test-fixtures/) with a known-
+# vulnerable dependency, a fake secret, and an unsafe code pattern, then
+# asserts every scanner lane both ran without crashing and actually
+# detected its seeded issue.
+#
+# Exists because the existing checks - lint-action-yaml.yml (YAML syntax)
+# and verify-pins.yml (pinned SHAs resolve to real commits) - never
+# actually run the action. Neither would have caught v6.5.1's bundled
+# Grype default (v0.97.1) going stale and failing to install in a
+# consumer repo: the SHA was real, the YAML was valid, and the only way
+# to see the install break is to actually run it. This workflow runs the
+# real thing, so a scanner version/tool bump that breaks install or
+# breaks our result-parsing fails here, in this repo, before it reaches
+# any consumer repo.
+name: Test security-scan action
+
+on:
+  pull_request:
+    paths:
+      - 'security-scan/**'
+      - '.github/workflows/test-security-scan.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - 'security-scan/**'
+  schedule:
+    # Weekly safety net, independent of any change here - catches the
+    # exact failure mode that prompted this workflow: an already-merged
+    # pin going stale (e.g. an old release asset starting to 404/504)
+    # with no action.yml edit to trigger the path filters above.
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Run security-scan against seeded fixtures
+        id: scan
+        uses: ./security-scan
+        with:
+          path: security-scan/test-fixtures
+          severity-cutoff: low
+          # Both diff-aware filters compare PR head vs base branch and
+          # suppress findings unchanged since the base commit. The seeded
+          # fixtures are already committed on both sides of any PR that
+          # doesn't touch them, so without this every PR-triggered run
+          # would suppress its own seeded findings as "pre-existing" and
+          # pass with zero findings regardless of whether the scanners
+          # actually work.
+          grype-diff-aware: 'false'
+          semgrep-diff-aware: 'false'
+          yarn-audit-diff-aware: 'false'
+          comment-on-pr: 'false'
+          fail-on-findings: 'false'
+
+      - name: Assert every scanner ran and caught its seeded finding
+        if: always()
+        env:
+          ANY_FAILED: ${{ steps.scan.outputs.any-failed }}
+          FAILED_SCANNERS: ${{ steps.scan.outputs.failed-scanners }}
+          GRYPE_FAILED: ${{ steps.scan.outputs.grype-failed }}
+          GRYPE_COUNT: ${{ steps.scan.outputs.grype-count }}
+          TRIVY_FAILED: ${{ steps.scan.outputs.trivy-failed }}
+          TRIVY_SECRETS_COUNT: ${{ steps.scan.outputs.trivy-secrets-count }}
+          SEMGREP_FAILED: ${{ steps.scan.outputs.semgrep-failed }}
+          SEMGREP_COUNT: ${{ steps.scan.outputs.semgrep-count }}
+        run: |
+          ok=true
+
+          if [ "$ANY_FAILED" = "true" ]; then
+            echo "::error::security-scan reported a crash/install failure: $FAILED_SCANNERS"
+            ok=false
+          fi
+
+          if [ "$GRYPE_FAILED" = "true" ] || [ "${GRYPE_COUNT:-0}" -eq 0 ]; then
+            echo "::error::Grype lane: expected >=1 finding from the seeded Django==1.8 fixture (test-fixtures/requirements.txt), got failed=$GRYPE_FAILED count=$GRYPE_COUNT. A version bump likely broke install or result-parsing."
+            ok=false
+          fi
+
+          if [ "$TRIVY_FAILED" = "true" ] || [ "${TRIVY_SECRETS_COUNT:-0}" -eq 0 ]; then
+            echo "::error::Trivy lane: expected >=1 secret finding from the seeded test-fixtures/fake-secret.env, got failed=$TRIVY_FAILED secrets-count=$TRIVY_SECRETS_COUNT. A version bump likely broke install or result-parsing."
+            ok=false
+          fi
+
+          if [ "$SEMGREP_FAILED" = "true" ] || [ "${SEMGREP_COUNT:-0}" -eq 0 ]; then
+            echo "::error::Semgrep lane: expected >=1 finding from the seeded test-fixtures/app.py (subprocess shell=True), got failed=$SEMGREP_FAILED count=$SEMGREP_COUNT. A version/ruleset bump likely broke install or result-parsing."
+            ok=false
+          fi
+
+          if [ "$ok" = false ]; then
+            exit 1
+          fi
+          echo "All scanner lanes ran and detected their seeded fixture."

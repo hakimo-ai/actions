@@ -72,6 +72,51 @@ outputs:
   findings-count:
     description: Total number of findings across all scanners
     value: ${{ steps.gate.outputs.total-findings }}
+  any-failed:
+    description: Whether any enabled scanner crashed/failed to install, independent of findings-count - 'true'/'false'. This is the same signal the action's own gate step fails the job on.
+    value: ${{ steps.gate.outputs.any-failed }}
+  failed-scanners:
+    description: Comma-separated list of scanners that crashed/failed to install, when any-failed is 'true'.
+    value: ${{ steps.gate.outputs.failed-scanners }}
+  grype-ran:
+    description: Whether Grype actually ran - 'false' when excluded via the scanners input, 'true' otherwise (whether it succeeded or crashed; see grype-failed). Distinguishes "excluded" from "ran clean" the way grype-failed alone cannot (both report failed=false, count=0).
+    value: ${{ steps.grype-summary.outputs.ran }}
+  grype-failed:
+    description: Whether Grype ran but crashed/failed to install - 'true'/'false'. Only meaningful when grype-ran is 'true'.
+    value: ${{ steps.grype-summary.outputs.failed }}
+  grype-count:
+    description: Number of Grype findings at or above severity-cutoff.
+    value: ${{ steps.grype-summary.outputs.count }}
+  trivy-ran:
+    description: Whether Trivy actually ran - 'false' when excluded via the scanners input, 'true' otherwise. See grype-ran for why this is distinct from trivy-failed.
+    value: ${{ steps.trivy-summary.outputs.ran }}
+  trivy-failed:
+    description: Whether Trivy ran but crashed/failed to install - 'true'/'false'. Only meaningful when trivy-ran is 'true'.
+    value: ${{ steps.trivy-summary.outputs.failed }}
+  trivy-count:
+    description: Number of Trivy findings (secrets + misconfig) at or above severity-cutoff.
+    value: ${{ steps.trivy-summary.outputs.count }}
+  trivy-secrets-count:
+    description: Number of Trivy secret findings specifically (subset of trivy-count).
+    value: ${{ steps.trivy-summary.outputs.secrets-count }}
+  semgrep-ran:
+    description: Whether Semgrep actually ran - 'false' when no SAST-eligible language was detected or it was excluded via the scanners input, 'true' otherwise. See grype-ran for why this is distinct from semgrep-failed.
+    value: ${{ steps.semgrep-summary.outputs.ran }}
+  semgrep-failed:
+    description: Whether Semgrep ran but crashed/failed to install - 'true'/'false'. Only meaningful when semgrep-ran is 'true'.
+    value: ${{ steps.semgrep-summary.outputs.failed }}
+  semgrep-count:
+    description: Number of Semgrep findings at or above severity-cutoff.
+    value: ${{ steps.semgrep-summary.outputs.count }}
+  yarn-audit-ran:
+    description: Whether yarn audit actually ran - 'false' when no yarn.lock was detected or it was excluded via the scanners input, 'true' otherwise. See grype-ran for why this is distinct from yarn-audit-failed.
+    value: ${{ steps.yarn-audit-summary.outputs.ran }}
+  yarn-audit-failed:
+    description: Whether yarn audit ran but crashed - 'true'/'false'. Only meaningful when yarn-audit-ran is 'true'.
+    value: ${{ steps.yarn-audit-summary.outputs.failed }}
+  yarn-audit-count:
+    description: Number of net-new yarn audit advisories at or above severity-cutoff.
+    value: ${{ steps.yarn-audit-summary.outputs.count }}
 
 runs:
   using: composite
@@ -485,7 +530,7 @@ runs:
 
     - name: Summarize Semgrep findings
       id: semgrep-summary
-      if: always() && steps.detect.outputs.sast == 'true'
+      if: always()
       shell: bash
       env:
         SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}

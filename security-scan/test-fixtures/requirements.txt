@@ -1,0 +1,4 @@
+# Deliberately pinned to an old, vulnerable release. Used only by
+# .github/workflows/test-security-scan.yml to prove Grype still detects a
+# known CVE after a Grype/anchore-scan-action version bump. Never installed.
+Django==1.8

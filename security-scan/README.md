@@ -43,6 +43,12 @@ Auto-detects Python, Node/JS/TS, Rust, C#/.NET, and Dockerfile/Terraform/K8s man
 | Output | Description |
 |--------|--------------|
 | `findings-count` | Total number of findings across all scanners |
+| `any-failed` | Whether any enabled scanner crashed/failed to install, independent of `findings-count` (`'true'`/`'false'`) |
+| `failed-scanners` | Comma-separated list of scanners that crashed/failed to install, when `any-failed` is `'true'` |
+| `grype-ran` / `trivy-ran` / `semgrep-ran` / `yarn-audit-ran` | Whether that scanner actually ran — `'false'` when excluded via `scanners` (or, for semgrep/yarn-audit, when no eligible language/lockfile was detected), `'true'` otherwise regardless of success. Distinguishes "excluded" from "ran clean", which the `*-failed`/`*-count` outputs alone cannot (both report `failed=false`, `count=0`) |
+| `grype-failed` / `trivy-failed` / `semgrep-failed` / `yarn-audit-failed` | Whether that scanner ran but crashed/failed to install (`'true'`/`'false'`). Only meaningful when the matching `*-ran` output is `'true'` |
+| `grype-count` / `trivy-count` / `semgrep-count` / `yarn-audit-count` | Number of findings from that scanner at or above `severity-cutoff` |
+| `trivy-secrets-count` | Number of Trivy secret findings specifically (subset of `trivy-count`) |
 
 ## Example
 
