@@ -93,6 +93,42 @@ done < <(
 echo ""
 echo "Checked $checked pinned action reference(s)."
 
+# --- grype-version / grype_version consistency -----------------------------
+# anchore/scan-action's own installer resolves grype-version directly
+# against a GitHub release tag (see its isReleaseTag()):
+#   /^v\d+\.\d+\.\d+([-+][\w.+-]+)?$/
+# A bare "0.121.2" (no 'v') fails that check silently - the installer logs a
+# warning, falls back to the default branch's install.sh, and then 404s
+# trying to download a release asset for a tag that was never 'v'-prefixed.
+# This exact mistake reached master undetected (code review included) since
+# nothing short of running the real installer exercises that regex - a
+# static pin-format check can't see it either unless it knows the same
+# regex. It does now: this reuses anchore/scan-action's own pattern, so it
+# can never drift out of sync with what the installer actually requires.
+#
+# The security-scan action also has a second, independent grype_version
+# ("v0.121.2" -> "0.121.2") in its "Grype diff-aware filter" step, which
+# builds its own download URL and deliberately wants the bare number - the
+# two must always be the same release, one bare and one 'v'-prefixed.
+grype_version_input=$(grep -oE "grype-version: '[^']*'" security-scan/action.yml | sed -E "s/grype-version: '([^']*)'/\1/" || true)
+grype_version_shell=$(grep -oE 'grype_version="[^"]*"' security-scan/action.yml | sed -E 's/grype_version="([^"]*)"/\1/' || true)
+
+if [ -z "$grype_version_input" ]; then
+  echo "FAIL  security-scan/action.yml: couldn't find a grype-version: '...' input on the anchore/scan-action step - has it been renamed or removed without updating this check?"
+  fail=1
+elif ! echo "$grype_version_input" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$'; then
+  echo "FAIL  security-scan/action.yml: grype-version '$grype_version_input' is not a 'vX.Y.Z' release tag (anchore/scan-action's own installer requires this exact format - see its isReleaseTag()). This is the silent-404 bug from 2026-11: a bare '0.121.2' installs nothing and 404s mid-CI."
+  fail=1
+elif [ -z "$grype_version_shell" ]; then
+  echo "FAIL  security-scan/action.yml: couldn't find the diff-aware filter step's grype_version=\"...\" shell variable - has it been renamed or removed without updating this check?"
+  fail=1
+elif [ "$grype_version_input" != "v$grype_version_shell" ]; then
+  echo "FAIL  security-scan/action.yml: grype-version '$grype_version_input' (anchore/scan-action step) and grype_version '$grype_version_shell' (diff-aware filter step) are out of sync - they should be the same release, just with/without the 'v' prefix."
+  fail=1
+else
+  echo "OK    security-scan/action.yml: grype-version '$grype_version_input' is a valid release tag and matches the diff-aware filter's grype_version '$grype_version_shell'"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "One or more pins failed verification - see FAIL lines above."
   exit 1

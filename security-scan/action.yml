@@ -276,9 +276,11 @@ runs:
         # Pin explicitly instead of relying on scan-action's bundled default -
         # that default silently resolved to v0.97.1, whose release asset
         # started 504ing on GitHub (unrelated to any PR, confirmed directly
-        # against the GitHub release URL). Keep in sync with grype_version
-        # in the diff-aware filter step below.
-        grype-version: '0.121.2'
+        # against the GitHub release URL). This installer resolves the
+        # version against real GitHub tags directly, so it needs the 'v'
+        # prefix (unlike grype_version in the diff-aware filter step below,
+        # which builds its own URL and adds the 'v' itself).
+        grype-version: 'v0.121.2'
 
     # Runs after anchore/scan-action so grype-results.json for the PR head
     # already exists. Scans the base-branch manifests, computes new CVE IDs,
