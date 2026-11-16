@@ -307,21 +307,22 @@ runs:
         curl -fsSL "https://github.com/anchore/grype/releases/download/v${grype_version}/grype_${grype_version}_linux_amd64.tar.gz" \
           | tar xzf - -C /usr/local/bin grype
 
-        # Only check out manifest files that changed between base and this PR -
-        # no need to restore the whole tree, just the files grype dir: reads.
-        changed_manifests=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null \
-          | grep -E '(^|/)((package|package-lock)\.json|yarn\.lock|Cargo\.(toml|lock)|go\.(mod|sum)|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|requirements[^/]*\.txt)$' \
-          || true)
-
-        if [ -n "$changed_manifests" ]; then
-          # shellcheck disable=SC2086
-          git checkout "$BASE_SHA" -- $changed_manifests 2>/dev/null || true
-          grype "dir:$SCAN_PATH" -o json --file grype-base.json
-          # shellcheck disable=SC2086
-          git checkout HEAD -- $changed_manifests 2>/dev/null || true
+        # Scan the base commit in a disposable worktree rather than gating on
+        # a manifest-filename regex. A filename-based gate can only recognize
+        # a fixed list of ecosystems - a dependency bump through an unlisted
+        # format (e.g. .csproj, Gemfile, composer.json) would look like
+        # "nothing changed" and wrongly suppress a brand-new finding as
+        # pre-existing instead of flagging it. Scanning the real base commit
+        # is correct regardless of which manifest format changed.
+        base_worktree="/tmp/grype-base-worktree-$$"
+        git worktree add --quiet --detach "$base_worktree" "$BASE_SHA"
+        if [ "$SCAN_PATH" = "." ]; then
+          base_scan_path="$base_worktree"
         else
-          echo '{"matches":[]}' > grype-base.json
+          base_scan_path="$base_worktree/$SCAN_PATH"
         fi
+        grype "dir:$base_scan_path" -o json --file grype-base.json
+        git worktree remove --force "$base_worktree"
 
         # Compare PR head findings (already in grype-results.json) against base.
         # Overwrite grype-results.json with only net-new matches so the summary
@@ -334,7 +335,9 @@ runs:
         pre = sorted({m["vulnerability"]["id"] for m in pr_matches} & base_ids)
         new_matches = [m for m in pr_matches if m["vulnerability"]["id"] not in base_ids]
         if pre:
-            print("::notice::Grype: " + str(len(pre)) + " pre-existing finding(s) suppressed: " + ", ".join(pre))
+            shown = pre[:20]
+            more = f" (+{len(pre) - 20} more)" if len(pre) > 20 else ""
+            print("::notice::Grype: " + str(len(pre)) + " pre-existing finding(s) suppressed: " + ", ".join(shown) + more)
         pr_data["matches"] = new_matches
         json.dump(pr_data, open("grype-results.json", "w"))
         print("Grype diff: " + str(len(new_matches)) + " new finding(s), " + str(len(pre)) + " pre-existing suppressed")
